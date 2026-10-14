@@ -1,0 +1,40 @@
+# ─── Project ───────────────────────────────────────
+node_modules/
+dist/
+.env
+*.local
+
+# ─── Java / Maven ──────────────────────────────────
+target/
+*.class
+*.jar
+*.war
+*.ear
+.mvn/wrapper/maven-wrapper.jar
+!.mvn/wrapper/maven-wrapper.properties
+
+# ─── Python ─────────────────────────────────────────
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ─── IDE ────────────────────────────────────────────
+.idea/
+.vscode/
+*.iml
+*.iws
+*.ipr
+.DS_Store
+Thumbs.db
+
+# ─── Secrets ────────────────────────────────────────
+.env
+*.env.local
+*.env.production
