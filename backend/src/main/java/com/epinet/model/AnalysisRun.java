@@ -12,7 +12,14 @@ import java.time.LocalDateTime;
 public class AnalysisRun {
 
     public enum Status {
-        UPLOADED, PROCESSING, COMPLETED, FAILED
+        /** Kafka path: job created, event not yet consumed by ML service */
+        PENDING,
+        /** Sync path: file received, not yet sent to ML service */
+        UPLOADED,
+        /** ML service is running the analysis */
+        PROCESSING,
+        COMPLETED,
+        FAILED
     }
 
     @Id
@@ -33,6 +40,15 @@ public class AnalysisRun {
 
     @Column(name = "error_message")
     private String errorMessage;
+
+    /**
+     * WHY: Kafka messages should be small (default limit ~1 MB). We store the
+     * uploaded CSV here so the Kafka event only carries analysisId. The ML
+     * service fetches the data via GET /api/internal/analyses/{id}/data.
+     */
+    @Lob
+    @Column(name = "csv_data")
+    private byte[] csvData;
 
     @Column(name = "created_at", nullable = false)
     private LocalDateTime createdAt;
@@ -73,4 +89,7 @@ public class AnalysisRun {
 
     public LocalDateTime getCompletedAt() { return completedAt; }
     public void setCompletedAt(LocalDateTime completedAt) { this.completedAt = completedAt; }
+
+    public byte[] getCsvData() { return csvData; }
+    public void setCsvData(byte[] csvData) { this.csvData = csvData; }
 }

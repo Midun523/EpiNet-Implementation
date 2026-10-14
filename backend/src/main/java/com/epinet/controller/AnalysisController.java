@@ -2,13 +2,18 @@ package com.epinet.controller;
 
 import com.epinet.dto.AnalysisSummary;
 import com.epinet.dto.StatusResponse;
+import com.epinet.kafka.AnalysisEventPublisher;
 import com.epinet.model.AnalysisRun;
 import com.epinet.repository.AnalysisRunRepository;
 import com.epinet.service.AnalysisService;
 import com.epinet.service.CsvValidator;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
@@ -20,28 +25,48 @@ import java.util.UUID;
 import java.util.stream.Collectors;
 
 /**
- * REST controller exposing the four analysis endpoints.
+ * REST controller exposing the analysis endpoints.
  * CORS is globally configured in {@link com.epinet.config.CorsConfig}.
+ *
+ * WHY TWO PATHS:
+ * The upload endpoint checks analysis.mode to decide between:
+ *   - "kafka": save PENDING row → publish event → return 202 (async, event-driven)
+ *   - "sync":  save UPLOADED row → call ML service via HTTP → return 202 (async, direct)
+ * Both paths are kept so Phase 5 can benchmark sync vs Kafka side-by-side.
  */
 @RestController
 @RequestMapping("/api")
 public class AnalysisController {
 
+    private static final Logger log = LoggerFactory.getLogger(AnalysisController.class);
+
     private final AnalysisRunRepository repo;
     private final AnalysisService analysisService;
     private final ObjectMapper mapper;
+    private final String analysisMode;
+
+    // nullable: only injected when analysis.mode=kafka
+    private final AnalysisEventPublisher eventPublisher;
 
     public AnalysisController(
             AnalysisRunRepository repo,
             AnalysisService analysisService,
-            ObjectMapper mapper
+            ObjectMapper mapper,
+            @Value("${analysis.mode:kafka}") String analysisMode,
+            // WHY Optional-style injection: when analysis.mode=sync, the
+            // AnalysisEventPublisher bean doesn't exist (@ConditionalOnProperty).
+            // Spring's required=false prevents a startup failure.
+            @org.springframework.beans.factory.annotation.Autowired(required = false)
+            AnalysisEventPublisher eventPublisher
     ) {
         this.repo = repo;
         this.analysisService = analysisService;
         this.mapper = mapper;
+        this.analysisMode = analysisMode;
+        this.eventPublisher = eventPublisher;
     }
 
-    // ── POST /api/uploads ─────────────────────────────────────────────────────
+    // ── POST /api/uploads ────────────────────────────────────────────────────
 
     @PostMapping("/uploads")
     public ResponseEntity<?> upload(@RequestParam("file") MultipartFile file) throws IOException {
@@ -50,17 +75,40 @@ public class AnalysisController {
         byte[] bytes = CsvValidator.validate(file);
 
         String analysisId = UUID.randomUUID().toString();
-        AnalysisRun run = new AnalysisRun(analysisId, file.getOriginalFilename());
-        repo.save(run);
 
-        // Fire-and-forget; response returns before background processing completes
-        analysisService.runAnalysis(analysisId, bytes, file.getOriginalFilename());
+        if ("kafka".equalsIgnoreCase(analysisMode)) {
+            // ── Kafka path ──────────────────────────────────────────────
+            // 1. Save PENDING row WITH csv data.
+            //    WHY saveAndFlush: guarantees the INSERT statement is flushed to MySQL
+            //    before the Kafka event is published, ensuring the ML worker never receives
+            //    an event for a record that doesn't yet exist in the DB.
+            AnalysisRun run = new AnalysisRun(analysisId, file.getOriginalFilename());
+            run.setStatus(AnalysisRun.Status.PENDING);
+            run.setCsvData(bytes);
+            repo.saveAndFlush(run);
 
-        return ResponseEntity.status(HttpStatus.ACCEPTED)
-                .body(Map.of("analysisId", analysisId, "status", "PROCESSING"));
+            log.info("Kafka path: saved PENDING job {}, publishing event", analysisId);
+            eventPublisher.publishRequested(analysisId, file.getOriginalFilename());
+
+            return ResponseEntity.status(HttpStatus.ACCEPTED)
+                    .body(Map.of("analysisId", analysisId, "status", "PENDING"));
+
+        } else {
+            // ── Sync path (original @Async + WebClient) ─────────────────
+            AnalysisRun run = new AnalysisRun(analysisId, file.getOriginalFilename());
+            // keep original UPLOADED status for backward compatibility
+            run.setCsvData(bytes);
+            repo.saveAndFlush(run);
+
+            log.info("Sync path: saved UPLOADED job {}, firing async HTTP call", analysisId);
+            analysisService.runAnalysis(analysisId, bytes, file.getOriginalFilename());
+
+            return ResponseEntity.status(HttpStatus.ACCEPTED)
+                    .body(Map.of("analysisId", analysisId, "status", "PROCESSING"));
+        }
     }
 
-    // ── GET /api/analyses/{id}/status ─────────────────────────────────────────
+    // ── GET /api/analyses/{id}/status ────────────────────────────────────────
 
     @GetMapping("/analyses/{id}/status")
     public ResponseEntity<StatusResponse> getStatus(@PathVariable String id) {
@@ -71,7 +119,7 @@ public class AnalysisController {
                 .orElse(ResponseEntity.notFound().build());
     }
 
-    // ── GET /api/analyses/{id}/result ─────────────────────────────────────────
+    // ── GET /api/analyses/{id}/result ────────────────────────────────────────
 
     @GetMapping("/analyses/{id}/result")
     public ResponseEntity<?> getResult(@PathVariable String id) {
@@ -94,7 +142,7 @@ public class AnalysisController {
                 .orElse(ResponseEntity.notFound().build());
     }
 
-    // ── GET /api/analyses (history) ───────────────────────────────────────────
+    // ── GET /api/analyses (history) ──────────────────────────────────────────
 
     @GetMapping("/analyses")
     public List<AnalysisSummary> listAnalyses() {
@@ -102,5 +150,32 @@ public class AnalysisController {
                 .map(r -> new AnalysisSummary(
                         r.getId(), r.getFilename(), r.getStatus().name(), r.getCreatedAt()))
                 .collect(Collectors.toList());
+    }
+
+    // ── GET /api/internal/analyses/{id}/data ─────────────────────────────────
+    // WHY: The Kafka message only carries analysisId (not the CSV data, which
+    // could exceed Kafka's 1 MB limit). The ML service calls this endpoint to
+    // fetch the CSV bytes stored in MySQL.
+    //
+    // PENDING -> PROCESSING transition:
+    // When the ML worker calls this endpoint to fetch the data, it confirms
+    // the worker has picked up the job and started computing. We transition
+    // status from PENDING to PROCESSING and flush to MySQL.
+
+    @GetMapping("/internal/analyses/{id}/data")
+    public ResponseEntity<byte[]> getAnalysisData(@PathVariable String id) {
+        return repo.findById(id)
+                .filter(r -> r.getCsvData() != null)
+                .map(r -> {
+                    if (r.getStatus() == AnalysisRun.Status.PENDING) {
+                        r.setStatus(AnalysisRun.Status.PROCESSING);
+                        repo.saveAndFlush(r);
+                        log.info("Job {} transitioned PENDING -> PROCESSING upon worker data fetch", id);
+                    }
+                    return ResponseEntity.ok()
+                            .contentType(MediaType.APPLICATION_OCTET_STREAM)
+                            .body(r.getCsvData());
+                })
+                .orElse(ResponseEntity.notFound().build());
     }
 }

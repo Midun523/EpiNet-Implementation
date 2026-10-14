@@ -14,7 +14,7 @@ import java.util.List;
  */
 public final class CsvValidator {
 
-    private static final long MAX_SIZE_BYTES = 5 * 1024 * 1024; // 5 MB
+    private static final long MAX_SIZE_BYTES = 50 * 1024 * 1024; // 50 MB
 
     private static final List<String> REQUIRED_GENE_COLUMNS = Arrays.asList(
             "CYP2D6", "CYP2C19", "CYP3A4", "CYP2C9",
@@ -40,7 +40,7 @@ public final class CsvValidator {
 
         if (file.getSize() > MAX_SIZE_BYTES) {
             throw new ValidationException(
-                    "File size " + file.getSize() / 1024 + " KB exceeds the 5 MB limit.");
+                    "File size " + file.getSize() / 1024 + " KB exceeds the 50 MB limit.");
         }
 
         byte[] bytes = file.getBytes();

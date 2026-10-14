@@ -23,7 +23,7 @@ const RESULT_TABS = [
 export default function App() {
   const [tab, setTab] = useState('upload');
   const [resultTab, setResultTab] = useState('graph');
-  const { phase, result, errorMsg, filename, startUpload, loadResult, reset } = useAnalysis();
+  const { phase, result, errorMsg, filename, backendStatus, startUpload, loadResult, reset } = useAnalysis();
 
   // Load a past result from the history page
   const loadHistoricResult = async (analysisId) => {
@@ -128,7 +128,7 @@ SAMPLE_001,0.72,0.45,0.38,0.91,...`}
         {tab === 'results' && (
           <div className="space-y-6 animate-slide-up">
             {/* Status bar */}
-            <StatusBar phase={phase} filename={filename} errorMsg={errorMsg} onReset={() => { reset(); setTab('upload'); }} />
+            <StatusBar phase={phase} filename={filename} errorMsg={errorMsg} backendStatus={backendStatus} onReset={() => { reset(); setTab('upload'); }} />
 
             {/* Result content */}
             {result && (
@@ -207,12 +207,18 @@ SAMPLE_001,0.72,0.45,0.38,0.91,...`}
 
 /* ── Sub-components ────────────────────────────────────────────────────────── */
 
-function StatusBar({ phase, filename, errorMsg, onReset }) {
+function StatusBar({ phase, filename, errorMsg, backendStatus, onReset }) {
   if (phase === 'idle') return null;
+
+  // WHY show PENDING vs PROCESSING: helps the user understand if their job is
+  // queued in Kafka (PENDING) or actively being computed (PROCESSING).
+  const processingMsg = backendStatus === 'PENDING'
+    ? `Queued — waiting for analysis worker to pick up ${filename}…`
+    : `Analyzing ${filename} — polling every 2 s…`;
 
   const configs = {
     uploading:  { color: 'border-indigo-700/50 bg-indigo-900/20', text: 'text-indigo-300', msg: `Uploading ${filename}…` },
-    processing: { color: 'border-amber-700/50 bg-amber-900/10',   text: 'text-amber-300',  msg: `Analyzing ${filename} — polling every 2 s…` },
+    processing: { color: 'border-amber-700/50 bg-amber-900/10',   text: 'text-amber-300',  msg: processingMsg },
     done:       { color: 'border-emerald-700/50 bg-emerald-900/10',text: 'text-emerald-300',msg: `Analysis complete for ${filename}` },
     error:      { color: 'border-red-700/50 bg-red-900/10',        text: 'text-red-300',    msg: errorMsg },
   };
@@ -222,6 +228,9 @@ function StatusBar({ phase, filename, errorMsg, onReset }) {
     <div className={`flex items-center gap-3 px-4 py-3 rounded-xl border ${cfg.color} ${cfg.text} text-sm animate-fade-in`}>
       {(phase === 'uploading' || phase === 'processing') && <div className="spinner shrink-0" style={{ width: 18, height: 18 }} />}
       <span className="flex-1">{cfg.msg}</span>
+      {backendStatus && (phase === 'uploading' || phase === 'processing') && (
+        <span className="text-xs opacity-50 font-mono">{backendStatus}</span>
+      )}
       {(phase === 'done' || phase === 'error') && (
         <button onClick={onReset} className="text-xs underline opacity-60 hover:opacity-100">Reset</button>
       )}

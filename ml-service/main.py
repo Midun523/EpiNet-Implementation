@@ -15,12 +15,25 @@ Scores are symmetrized, zeroed on the diagonal, and scaled to [0, 1].
 Architecture note:
 This classical regression on synthetic data is designed so a trained graph-attention
 or transformer model can be dropped in as future scope.
+
+Phase 1 addition — Kafka integration:
+In addition to the existing POST /analyze HTTP endpoint, this service now also
+runs a Kafka consumer loop that listens to "analysis.requested" events. When an
+event arrives, it fetches the CSV from the Spring Boot backend, runs the analysis
+in a thread executor (to avoid blocking the asyncio loop / /health endpoint),
+and publishes the result to "analysis.completed".
 """
 
-import hashlib
+import asyncio
 import io
+import json
 import logging
-from typing import Any
+import os
+import urllib.request
+import urllib.error
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
+from typing import Any, Optional
 
 import numpy as np
 import pandas as pd
@@ -32,18 +45,11 @@ from sklearn.preprocessing import MinMaxScaler
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(
-    title="EpiNet ML Microservice",
-    description="Pairwise interaction regression epistasis scorer.",
-    version="1.2.0",
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# ── Configuration ────────────────────────────────────────────────────────────
+# WHY env vars: lets Docker Compose / Kubernetes override these without editing code.
+KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8080")
+KAFKA_ENABLED = os.getenv("KAFKA_ENABLED", "true").lower() == "true"
 
 # The 10 pharmacogenomic genes this service expects
 EXPECTED_GENES = [
@@ -52,6 +58,13 @@ EXPECTED_GENES = [
 ]
 TOP_PAIRS_COUNT = 15
 
+# WHY a thread pool: the scikit-learn regression is CPU-bound. Running it in a
+# thread executor prevents it from blocking the asyncio event loop, which would
+# make the /health endpoint unresponsive during analysis.
+_analysis_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="analysis")
+
+
+# ── Core analysis functions (unchanged from original) ────────────────────────
 
 def _compute_interaction_matrix(gene_df: pd.DataFrame, phenotype: pd.Series) -> np.ndarray:
     """
@@ -118,33 +131,29 @@ def _validate_and_load(content: bytes) -> tuple[pd.DataFrame, pd.Series, int]:
     try:
         df = pd.read_csv(io.BytesIO(content))
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Cannot parse CSV: {exc}")
+        raise ValueError(f"Cannot parse CSV: {exc}")
 
     df.columns = df.columns.str.strip()
 
     if "sample_id" not in df.columns:
-        raise HTTPException(status_code=400, detail="Missing required column: sample_id")
+        raise ValueError("Missing required column: sample_id")
     if "phenotype" not in df.columns:
-        raise HTTPException(status_code=400, detail="Missing required column: phenotype")
+        raise ValueError("Missing required column: phenotype")
 
     missing_genes = [g for g in EXPECTED_GENES if g not in df.columns]
     if missing_genes:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Missing gene columns: {missing_genes}. Expected: {EXPECTED_GENES}",
-        )
+        raise ValueError(f"Missing gene columns: {missing_genes}. Expected: {EXPECTED_GENES}")
 
     if len(df) < 3:
-        raise HTTPException(
-            status_code=400,
-            detail=f"CSV has only {len(df)} row(s). At least 3 rows are required for interaction regression.",
+        raise ValueError(
+            f"CSV has only {len(df)} row(s). At least 3 rows are required for interaction regression."
         )
 
     gene_df = df[EXPECTED_GENES].apply(pd.to_numeric, errors="coerce")
     phenotype = pd.to_numeric(df["phenotype"], errors="coerce")
 
     if gene_df.isnull().all().any():
-        raise HTTPException(status_code=400, detail="One or more gene columns are entirely non-numeric.")
+        raise ValueError("One or more gene columns are entirely non-numeric.")
 
     # Impute missing cells if any
     gene_df = gene_df.fillna(gene_df.mean())
@@ -153,39 +162,24 @@ def _validate_and_load(content: bytes) -> tuple[pd.DataFrame, pd.Series, int]:
     # Variance validation: constant columns cause singular matrices
     zero_var_genes = [g for g in EXPECTED_GENES if float(gene_df[g].std(ddof=0)) == 0.0]
     if zero_var_genes:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Zero-variance detected in gene column(s): {zero_var_genes}. All genes must have variance.",
+        raise ValueError(
+            f"Zero-variance detected in gene column(s): {zero_var_genes}. All genes must have variance."
         )
 
     if float(phenotype.std(ddof=0)) == 0.0:
-        raise HTTPException(
-            status_code=400,
-            detail="Zero-variance detected in phenotype column. Phenotype values must vary across samples.",
+        raise ValueError(
+            "Zero-variance detected in phenotype column. Phenotype values must vary across samples."
         )
 
     return gene_df, phenotype, len(df)
 
 
-@app.get("/health")
-async def health() -> dict[str, str]:
-    """Health check endpoint."""
-    return {"status": "ok"}
-
-
-@app.post("/analyze")
-async def analyze(file: UploadFile = File(...)) -> dict[str, Any]:
+def _run_full_analysis(content: bytes) -> dict[str, Any]:
     """
-    Accept a pharmacogenomic CSV, run pairwise interaction regression,
-    and return an epistasis interaction matrix plus top pair scores.
+    Synchronous function that validates CSV and runs the full epistasis analysis.
+    WHY a separate function: called from both the HTTP endpoint and the Kafka
+    consumer (via run_in_executor) so the logic isn't duplicated.
     """
-    if not file.filename.endswith(".csv"):
-        raise HTTPException(status_code=400, detail="Only .csv files are accepted.")
-
-    content = await file.read()
-    if len(content) == 0:
-        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
-
     gene_df, phenotype, rows_processed = _validate_and_load(content)
 
     logger.info("Analyzing %d rows", rows_processed)
@@ -213,3 +207,257 @@ async def analyze(file: UploadFile = File(...)) -> dict[str, Any]:
             "model": "interaction-regression-v1",
         },
     }
+
+
+def _fetch_csv_from_backend(analysis_id: str) -> bytes:
+    """
+    WHY: Kafka messages only carry the analysisId (not CSV data) to stay under
+    Kafka's 1 MB message limit. This fetches the CSV bytes from the backend's
+    internal endpoint using stdlib urllib (no extra dependency needed).
+    """
+    url = f"{BACKEND_URL}/api/internal/analyses/{analysis_id}/data"
+    req = urllib.request.Request(url)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            return response.read()
+    except urllib.error.HTTPError as e:
+        raise ValueError(f"Backend returned HTTP {e.code} when fetching CSV for {analysis_id}")
+    except urllib.error.URLError as e:
+        raise ValueError(f"Cannot reach backend at {url}: {e.reason}")
+
+
+def _fetch_status_from_backend(analysis_id: str) -> Optional[str]:
+    """
+    WHY: Idempotency. Before running a 30-second CPU-bound regression, check if
+    the job was already finalized (COMPLETED or FAILED). If so, we skip it
+    rather than wasting compute on re-delivered or replayed Kafka events.
+    """
+    url = f"{BACKEND_URL}/api/analyses/{analysis_id}/status"
+    req = urllib.request.Request(url)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as response:
+            data = json.loads(response.read().decode("utf-8"))
+            return data.get("status")
+    except Exception as e:
+        logger.debug("Could not check status for %s: %s", analysis_id, e)
+        return None
+
+
+def _fetch_and_analyze(analysis_id: str) -> dict[str, Any]:
+    """
+    Synchronous helper: fetch CSV from backend + run analysis.
+    WHY a combined function: both steps are blocking I/O + CPU, so they run
+    together in the thread pool executor to keep the asyncio loop free.
+    """
+    csv_bytes = _fetch_csv_from_backend(analysis_id)
+    return _run_full_analysis(csv_bytes)
+
+
+# ── Kafka consumer loop ─────────────────────────────────────────────────────
+
+async def _kafka_consumer_loop():
+    """
+    WHY THIS FUNCTION EXISTS:
+    Listens to "analysis.requested" events from Kafka, runs the analysis in a
+    thread executor (because scikit-learn is CPU-bound), and publishes the
+    result (or error) to "analysis.completed".
+
+    Retry/DLQ: if the analysis fails, we publish a FAILED event rather than
+    letting the message sit unconsumed. This ensures the backend marks the job
+    as FAILED and the frontend stops polling.
+    """
+    from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
+
+    # WHY retry loop: Kafka may not be ready when the service starts
+    consumer = None
+    producer = None
+    for attempt in range(30):
+        try:
+            consumer = AIOKafkaConsumer(
+                "analysis.requested",
+                bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+                group_id="epinet-ml-service",
+                value_deserializer=lambda m: json.loads(m.decode("utf-8")),
+                key_deserializer=lambda m: m.decode("utf-8") if m else None,
+                auto_offset_reset="earliest",
+                enable_auto_commit=True,
+            )
+            producer = AIOKafkaProducer(
+                bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+                value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+                key_serializer=lambda k: k.encode("utf-8") if k else None,
+            )
+            await consumer.start()
+            await producer.start()
+            logger.info("Kafka consumer and producer started successfully")
+            break
+        except Exception as e:
+            logger.warning("Kafka not ready (attempt %d/30): %s", attempt + 1, e)
+            if consumer:
+                try:
+                    await consumer.stop()
+                except Exception:
+                    pass
+            if producer:
+                try:
+                    await producer.stop()
+                except Exception:
+                    pass
+            consumer = None
+            producer = None
+            await asyncio.sleep(2)
+    else:
+        logger.error("Could not connect to Kafka after 30 attempts. Consumer loop will not run.")
+        return
+
+    loop = asyncio.get_event_loop()
+
+    try:
+        async for msg in consumer:
+            event = msg.value
+            analysis_id = event.get("analysisId")
+            if not analysis_id:
+                logger.warning("Received event without analysisId: %s", event)
+                continue
+
+            logger.info("Received analysis.requested for %s", analysis_id)
+
+            # WHY skip COMPLETED or FAILED: if Kafka re-delivers an event after a consumer
+            # restart or crash, we must not repeat a heavy 30s analysis for a finalized job.
+            current_status = await loop.run_in_executor(
+                _analysis_executor, _fetch_status_from_backend, analysis_id
+            )
+            if current_status in ("COMPLETED", "FAILED"):
+                logger.info(
+                    "Skipping analysis %s: already in terminal state %s",
+                    analysis_id, current_status,
+                )
+                continue
+
+            try:
+                # WHY run_in_executor: scikit-learn regression is CPU-bound.
+                # Running it on the asyncio loop would block /health responses.
+                result = await loop.run_in_executor(
+                    _analysis_executor, _fetch_and_analyze, analysis_id
+                )
+                result_json = json.dumps(result)
+
+                completion_event = {
+                    "analysisId": analysis_id,
+                    "status": "COMPLETED",
+                    "resultJson": result_json,
+                    "errorMessage": None,
+                }
+                await producer.send_and_wait(
+                    "analysis.completed",
+                    key=analysis_id,
+                    value=completion_event,
+                )
+                logger.info("Published COMPLETED event for %s", analysis_id)
+
+            except Exception as e:
+                logger.error("Analysis %s failed: %s", analysis_id, str(e), exc_info=True)
+
+                # WHY publish FAILED: if we don't, the job stays PENDING forever
+                # and the frontend polls until its 5-minute timeout.
+                failure_event = {
+                    "analysisId": analysis_id,
+                    "status": "FAILED",
+                    "resultJson": None,
+                    "errorMessage": str(e),
+                }
+                try:
+                    await producer.send_and_wait(
+                        "analysis.completed",
+                        key=analysis_id,
+                        value=failure_event,
+                    )
+                    logger.info("Published FAILED event for %s", analysis_id)
+                except Exception as pub_err:
+                    logger.error(
+                        "Could not publish FAILED event for %s: %s",
+                        analysis_id, pub_err,
+                    )
+    except asyncio.CancelledError:
+        logger.info("Kafka consumer loop cancelled (shutdown)")
+    except Exception as e:
+        logger.error("Kafka consumer loop crashed: %s", e, exc_info=True)
+    finally:
+        await consumer.stop()
+        await producer.stop()
+        logger.info("Kafka consumer and producer stopped")
+
+
+# ── FastAPI app with lifespan ────────────────────────────────────────────────
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    WHY lifespan: starts the Kafka consumer loop as a background task when the
+    app starts, and cancels it on shutdown. This is the modern FastAPI pattern
+    (replaces on_startup/on_shutdown events).
+    """
+    kafka_task = None
+    if KAFKA_ENABLED:
+        kafka_task = asyncio.create_task(_kafka_consumer_loop())
+        logger.info("Kafka consumer background task started")
+    else:
+        logger.info("Kafka disabled (KAFKA_ENABLED=false), HTTP-only mode")
+
+    yield  # App is running
+
+    if kafka_task and not kafka_task.done():
+        kafka_task.cancel()
+        try:
+            await kafka_task
+        except asyncio.CancelledError:
+            pass
+    logger.info("ML service shutdown complete")
+
+
+app = FastAPI(
+    title="EpiNet ML Microservice",
+    description="Pairwise interaction regression epistasis scorer.",
+    version="1.2.0",
+    lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ── HTTP endpoints (preserved from original) ────────────────────────────────
+
+@app.get("/health")
+async def health() -> dict[str, str]:
+    """Health check endpoint."""
+    return {"status": "ok"}
+
+
+@app.post("/analyze")
+async def analyze(file: UploadFile = File(...)) -> dict[str, Any]:
+    """
+    Accept a pharmacogenomic CSV, run pairwise interaction regression,
+    and return an epistasis interaction matrix plus top pair scores.
+
+    WHY this endpoint is KEPT: the sync analysis path (analysis.mode=sync)
+    uses it via direct HTTP. Both paths coexist for Phase 5 benchmarking.
+    """
+    if not file.filename.endswith(".csv"):
+        raise HTTPException(status_code=400, detail="Only .csv files are accepted.")
+
+    content = await file.read()
+    if len(content) == 0:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+    try:
+        # WHY run_in_executor: same CPU-bound reason as the Kafka path.
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(_analysis_executor, _run_full_analysis, content)
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))

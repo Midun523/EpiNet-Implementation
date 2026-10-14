@@ -2,11 +2,18 @@ import { useCallback, useRef, useState } from 'react';
 import { uploadCsv, getStatus, getResult } from '../api';
 
 const POLL_INTERVAL_MS = 2000;
-const MAX_POLL_ATTEMPTS = 60; // 60 * 2000ms = 120s timeout limit
+// WHY 5 minutes: long enough for real analyses but prevents infinite polling
+// if the backend or ML service is truly dead.
+const MAX_POLL_ATTEMPTS = 150; // 150 * 2000ms = 300s = 5 minutes
 
 /**
  * Custom hook managing the full upload → poll → result lifecycle.
  * Provides clean actions: `startUpload`, `loadResult`, and `reset`.
+ *
+ * Phase 1 changes:
+ * - Increased timeout from 2 min to 5 min (Kafka path can be slower on first run)
+ * - Treats both PENDING and PROCESSING as valid "waiting" states
+ * - Shows which status we're actually in (PENDING vs PROCESSING) for debugging
  */
 export function useAnalysis() {
   const [phase, setPhase] = useState('idle'); // idle | uploading | processing | done | error
@@ -14,6 +21,7 @@ export function useAnalysis() {
   const [result, setResult] = useState(null);
   const [errorMsg, setErrorMsg] = useState('');
   const [filename, setFilename] = useState('');
+  const [backendStatus, setBackendStatus] = useState(''); // raw status from backend (PENDING, PROCESSING, etc.)
   const pollRef = useRef(null);
 
   const stopPolling = useCallback(() => {
@@ -29,6 +37,7 @@ export function useAnalysis() {
     setResult(null);
     setErrorMsg('');
     setFilename(file.name);
+    setBackendStatus('');
 
     try {
       const { analysisId: id } = await uploadCsv(file);
@@ -42,13 +51,17 @@ export function useAnalysis() {
         attempts++;
         if (attempts >= MAX_POLL_ATTEMPTS) {
           stopPolling();
-          setErrorMsg('Analysis timed out after 2 minutes. The backend may still be processing.');
+          setErrorMsg('Analysis timed out after 5 minutes. The backend may still be processing — check the History tab later.');
           setPhase('error');
           return;
         }
 
         try {
           const status = await getStatus(id);
+          // WHY track backendStatus: so the UI can distinguish PENDING
+          // (queued in Kafka) from PROCESSING (ML service is working).
+          setBackendStatus(status.status);
+
           if (status.status === 'COMPLETED') {
             stopPolling();
             const data = await getResult(id);
@@ -59,6 +72,7 @@ export function useAnalysis() {
             setErrorMsg(status.errorMessage || 'Analysis failed on the server.');
             setPhase('error');
           }
+          // PENDING and PROCESSING both mean "still working" — keep polling
         } catch (err) {
           stopPolling();
           setErrorMsg(err.message || 'Failed to poll analysis status.');
@@ -82,6 +96,7 @@ export function useAnalysis() {
     setErrorMsg('');
     setFilename(name);
     setAnalysisId(id);
+    setBackendStatus('COMPLETED');
   }, [stopPolling]);
 
   const reset = useCallback(() => {
@@ -91,6 +106,7 @@ export function useAnalysis() {
     setResult(null);
     setErrorMsg('');
     setFilename('');
+    setBackendStatus('');
   }, [stopPolling]);
 
   return {
@@ -99,6 +115,7 @@ export function useAnalysis() {
     result,
     errorMsg,
     filename,
+    backendStatus, // new: raw backend status for UI display
     startUpload,
     loadResult,
     reset,

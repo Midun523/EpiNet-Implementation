@@ -34,7 +34,6 @@ htmlcov/
 .DS_Store
 Thumbs.db
 
-# ─── Secrets ────────────────────────────────────────
-.env
-*.env.local
-*.env.production
+# ─── Local Tools & Scratch ──────────────────────────
+.tools/
+scratch/
