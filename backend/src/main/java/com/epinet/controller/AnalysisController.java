@@ -72,8 +72,12 @@ public class AnalysisController {
     public ResponseEntity<?> upload(@RequestParam("file") MultipartFile file) throws IOException {
         long tUploadStart = System.currentTimeMillis();
 
+        // ── Sub-stage: multipart received ─────────────────────────────
+        long tMultipartDone = System.currentTimeMillis();
+
         // Validate CSV structure and encoding; throws ValidationException on failure
         byte[] bytes = CsvValidator.validate(file);
+        long tValidateDone = System.currentTimeMillis();
 
         String analysisId = UUID.randomUUID().toString();
 
@@ -86,17 +90,27 @@ public class AnalysisController {
             AnalysisRun run = new AnalysisRun(analysisId, file.getOriginalFilename());
             run.setStatus(AnalysisRun.Status.PENDING);
             run.setCsvData(bytes);
-            long tSaveStart = System.currentTimeMillis();
+            long tEntityBuilt = System.currentTimeMillis();
+
             repo.saveAndFlush(run);
-            long tSaveEnd = System.currentTimeMillis();
+            long tSaveDone = System.currentTimeMillis();
 
-            long tPubStart = System.currentTimeMillis();
             eventPublisher.publishRequested(analysisId, file.getOriginalFilename());
-            long tPubEnd = System.currentTimeMillis();
+            long tPubDone = System.currentTimeMillis();
 
-            long tUploadTotal = System.currentTimeMillis() - tUploadStart;
-            log.info("STAGE TIMING: Job {} upload_received -> event_published total={} ms (db_save={} ms, kafka_publish={} ms)",
-                    analysisId, tUploadTotal, (tSaveEnd - tSaveStart), (tPubEnd - tPubStart));
+            // WHY sub-stage logging: isolates which sub-operation within the upload
+            // path contributes to the 6-52s regression seen in Phase 2 benchmarks.
+            log.info("STAGE TIMING: Job {} upload_received -> event_published total={} ms "
+                    + "(multipart_recv={} ms, csv_validate={} ms, entity_build={} ms, "
+                    + "db_insert={} ms, kafka_publish={} ms, csv_size={} bytes)",
+                    analysisId,
+                    (tPubDone - tUploadStart),
+                    (tMultipartDone - tUploadStart),
+                    (tValidateDone - tMultipartDone),
+                    (tEntityBuilt - tValidateDone),
+                    (tSaveDone - tEntityBuilt),
+                    (tPubDone - tSaveDone),
+                    bytes.length);
 
             return ResponseEntity.status(HttpStatus.ACCEPTED)
                     .body(Map.of("analysisId", analysisId, "status", "PENDING"));

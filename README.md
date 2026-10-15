@@ -316,6 +316,12 @@ All observability metrics and scrape targets were verified during end-to-end tes
 
 ---
 
+## Data Retention & Lifecycle
+
+- **Uploaded CSV Deletion on Terminal States**: Raw uploaded CSV data (`csv_data` LONGBLOB) is stored temporarily in MySQL solely to allow the asynchronous ML worker to fetch the input dataset. Once an analysis transitions to a terminal state (`COMPLETED` or `FAILED`), the targeted repository updates (`markCompleted` and `markFailed`) set `csv_data = NULL`. This immediately reclaims tablespace, bounds storage consumption, and avoids persisting sensitive patient genomic data beyond the processing lifecycle. Computed interaction matrices and summary statistics remain permanently available in `result_json`.
+
+---
+
 ## Known Limitations
 
 - **Unauthenticated internal data endpoint**: The internal endpoint `/api/internal/analyses/{id}/data` serves raw CSV bytes to the ML worker without authentication (assumes trusted internal network).

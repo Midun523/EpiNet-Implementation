@@ -37,3 +37,4 @@ Thumbs.db
 # ─── Local Tools & Scratch ──────────────────────────
 .tools/
 scratch/
+*.log

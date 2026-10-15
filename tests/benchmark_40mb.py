@@ -83,48 +83,62 @@ def poll_for_completion(analysis_id, timeout=120):
 def extract_stage_timings(backend_log_path, ml_log_path, analysis_id):
     stages = {
         "upload_to_published": None,
+        "multipart_recv": None,
+        "csv_validate": None,
+        "entity_build": None,
+        "db_insert": None,
+        "kafka_publish": None,
         "queue_wait": None,
         "csv_fetch": None,
         "compute": None,
         "result_write_back": None,
     }
 
-    if os.path.exists(backend_log_path):
-        with open(backend_log_path, "r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                if analysis_id in line:
-                    # Match upload_received -> event_published total=123 ms
-                    m = re.search(r"upload_received -> event_published total=(\d+)\s*ms", line)
-                    if m:
-                        stages["upload_to_published"] = round(int(m.group(1)) / 1000.0, 3)
-                    # Match marked COMPLETED in MySQL (db_update took 45 ms)
-                    m2 = re.search(r"marked COMPLETED in MySQL \(db_update took (\d+)\s*ms\)", line)
-                    if m2:
-                        stages["result_write_back"] = round(int(m2.group(1)) / 1000.0, 3)
+    def read_lines(path):
+        if not path or not os.path.exists(path):
+            return []
+        try:
+            with open(path, "rb") as f:
+                raw = f.read()
+            if raw.startswith(b"\xff\xfe") or b"\x00" in raw[:200]:
+                text = raw.decode("utf-16le", errors="ignore")
+            else:
+                text = raw.decode("utf-8", errors="ignore")
+            return text.splitlines()
+        except Exception:
+            return []
 
-    if os.path.exists(ml_log_path):
-        with open(ml_log_path, "r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                if analysis_id in line:
-                    # queue_wait=0.012s
-                    m_qw = re.search(r"queue_wait=([\d\.]+)s", line)
-                    if m_qw:
-                        stages["queue_wait"] = round(float(m_qw.group(1)), 3)
-                    # csv_fetch=1.234s
-                    m_cf = re.search(r"csv_fetch=([\d\.]+)s", line)
-                    if m_cf:
-                        stages["csv_fetch"] = round(float(m_cf.group(1)), 3)
-                # compute=5.678s
-                if "STAGE TIMING: compute=" in line:
-                    m_comp = re.search(r"compute=([\d\.]+)s", line)
-                    if m_comp:
-                        stages["compute"] = round(float(m_comp.group(1)), 3)
+    for line in read_lines(backend_log_path):
+        if analysis_id in line:
+            m = re.search(r"upload_received -> event_published total=(\d+)\s*ms", line)
+            if m:
+                stages["upload_to_published"] = round(int(m.group(1)) / 1000.0, 3)
+            for sub in ["multipart_recv", "csv_validate", "entity_build", "db_insert", "kafka_publish"]:
+                m_sub = re.search(sub + r"=(\d+)\s*ms", line)
+                if m_sub:
+                    stages[sub] = round(int(m_sub.group(1)) / 1000.0, 3)
+            m2 = re.search(r"marked COMPLETED in MySQL \(db_update took (\d+)\s*ms\)", line)
+            if m2:
+                stages["result_write_back"] = round(int(m2.group(1)) / 1000.0, 3)
+
+    for line in read_lines(ml_log_path):
+        if analysis_id in line:
+            m_qw = re.search(r"queue_wait=([\d\.]+)s", line)
+            if m_qw:
+                stages["queue_wait"] = round(float(m_qw.group(1)), 3)
+            m_cf = re.search(r"csv_fetch=([\d\.]+)s", line)
+            if m_cf:
+                stages["csv_fetch"] = round(float(m_cf.group(1)), 3)
+        if "STAGE TIMING: compute=" in line:
+            m_comp = re.search(r"compute=([\d\.]+)s", line)
+            if m_comp:
+                stages["compute"] = round(float(m_comp.group(1)), 3)
 
     return stages
 
 def run_benchmark(num_runs=5, backend_log=None, ml_log=None):
     print(f"\n=======================================================")
-    print(f"=== Starting 40 MB Benchmark ({num_runs} runs, Observability RUNNING) ===")
+    print(f"=== Starting 40 MB Benchmark ({num_runs} runs) ===")
     print(f"=======================================================")
     t_gen = time.time()
     csv_bytes = generate_csv_bytes(40.0)
@@ -156,9 +170,11 @@ def run_benchmark(num_runs=5, backend_log=None, ml_log=None):
         results.append(stages)
 
     print("\n=======================================================")
-    print("=== 40 MB Benchmark Summary (Min / Median / Max across 5 runs) ===")
+    print(f"=== 40 MB Benchmark Summary (Min / Median / Max across {num_runs} runs) ===")
     print("=======================================================")
-    keys = ["client_upload", "upload_to_published", "queue_wait", "csv_fetch", "compute", "result_write_back", "poll_duration", "total_e2e"]
+    keys = ["client_upload", "upload_to_published",
+            "multipart_recv", "csv_validate", "entity_build", "db_insert", "kafka_publish",
+            "queue_wait", "csv_fetch", "compute", "result_write_back", "poll_duration", "total_e2e"]
     for k in keys:
         vals = [r[k] for r in results if r.get(k) is not None]
         if vals:

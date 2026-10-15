@@ -30,7 +30,7 @@ public interface AnalysisRunRepository extends JpaRepository<AnalysisRun, String
      * WHY updateStatusIf: Targeted single-column UPDATE. Transitions status without
      * loading or rewriting the 40 MB csv_data blob.
      */
-    @Modifying
+    @Modifying(clearAutomatically = true)
     @Transactional
     @Query("UPDATE AnalysisRun a SET a.status = :status WHERE a.id = :id AND a.status = :expectedStatus")
     int updateStatusIf(
@@ -49,10 +49,12 @@ public interface AnalysisRunRepository extends JpaRepository<AnalysisRun, String
     /**
      * WHY markCompleted: Targeted UPDATE for terminal status. Sets status, resultJson,
      * completedAt, and clears csvData (sets NULL) in a single query without rewriting the blob.
+     * WHY status guard: returns 0 if the job is already COMPLETED or FAILED, making the
+     * query idempotent at the SQL level (not just the consumer level).
      */
-    @Modifying
+    @Modifying(clearAutomatically = true)
     @Transactional
-    @Query("UPDATE AnalysisRun a SET a.status = com.epinet.model.AnalysisRun$Status.COMPLETED, a.resultJson = :resultJson, a.completedAt = :completedAt, a.csvData = NULL, a.errorMessage = NULL WHERE a.id = :id")
+    @Query("UPDATE AnalysisRun a SET a.status = com.epinet.model.AnalysisRun$Status.COMPLETED, a.resultJson = :resultJson, a.completedAt = :completedAt, a.csvData = NULL, a.errorMessage = NULL WHERE a.id = :id AND a.status IN (com.epinet.model.AnalysisRun$Status.PENDING, com.epinet.model.AnalysisRun$Status.PROCESSING)")
     int markCompleted(
             @Param("id") String id,
             @Param("resultJson") String resultJson,
@@ -62,10 +64,12 @@ public interface AnalysisRunRepository extends JpaRepository<AnalysisRun, String
     /**
      * WHY markFailed: Targeted UPDATE for failed status. Sets status, errorMessage,
      * completedAt, and clears csvData in a single query without rewriting the blob.
+     * WHY status guard: returns 0 if the job is already COMPLETED or FAILED, making the
+     * query idempotent at the SQL level (not just the consumer level).
      */
-    @Modifying
+    @Modifying(clearAutomatically = true)
     @Transactional
-    @Query("UPDATE AnalysisRun a SET a.status = com.epinet.model.AnalysisRun$Status.FAILED, a.errorMessage = :errorMessage, a.completedAt = :completedAt, a.csvData = NULL WHERE a.id = :id")
+    @Query("UPDATE AnalysisRun a SET a.status = com.epinet.model.AnalysisRun$Status.FAILED, a.errorMessage = :errorMessage, a.completedAt = :completedAt, a.csvData = NULL WHERE a.id = :id AND a.status IN (com.epinet.model.AnalysisRun$Status.PENDING, com.epinet.model.AnalysisRun$Status.PROCESSING)")
     int markFailed(
             @Param("id") String id,
             @Param("errorMessage") String errorMessage,

@@ -46,7 +46,7 @@ from sklearn.preprocessing import MinMaxScaler
 from starlette.responses import Response
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("uvicorn.error")
 
 # ── Prometheus Observability Metrics (Phase 2) ──────────────────────────────
 # WHY: Exposes ML analysis duration histogram, processed jobs counter

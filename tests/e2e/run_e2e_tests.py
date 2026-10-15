@@ -101,7 +101,7 @@ def start_backend(mode="kafka"):
     env["ANALYSIS_MODE"] = mode
     env["KAFKA_BOOTSTRAP_SERVERS"] = "localhost:9092"
     env["ML_SERVICE_URL"] = "http://localhost:8000"
-    env["DB_URL"] = "jdbc:mysql://localhost:3307/epinet?createDatabaseIfNotExist=true&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC"
+    env["DB_URL"] = "jdbc:mysql://localhost:3307/epinet?createDatabaseIfNotExist=true&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC&useServerPrepStmts=true"
     env["DB_USER"] = "epinet"
     env["DB_PASS"] = "epinet_pass"
     cmd = [

@@ -43,24 +43,24 @@ public final class CsvValidator {
                     "File size " + file.getSize() / 1024 + " KB exceeds the 50 MB limit.");
         }
 
-        byte[] bytes = file.getBytes();
-        if (bytes.length == 0) {
+        if (file.isEmpty()) {
             throw new ValidationException("Uploaded file is empty.");
         }
 
-        // Decode with UTF-8 explicitly and strip UTF-8 Byte Order Mark (BOM) if exported by Excel
-        String content = new String(bytes, StandardCharsets.UTF_8);
-        if (content.startsWith("\uFEFF")) {
-            content = content.substring(1);
+        String headerLine;
+        try (java.io.BufferedReader reader = new java.io.BufferedReader(
+                new java.io.InputStreamReader(file.getInputStream(), StandardCharsets.UTF_8))) {
+            headerLine = reader.readLine();
         }
-
-        content = content.replace("\r\n", "\n").replace("\r", "\n");
-        String[] lines = content.split("\n", 2);
-        if (lines.length == 0 || lines[0].isBlank()) {
+        if (headerLine == null || headerLine.isBlank()) {
             throw new ValidationException("CSV is missing a header row.");
         }
+        // Strip UTF-8 Byte Order Mark (BOM) if exported by Excel
+        if (headerLine.startsWith("\uFEFF")) {
+            headerLine = headerLine.substring(1);
+        }
 
-        List<String> headers = Arrays.stream(lines[0].split(","))
+        List<String> headers = Arrays.stream(headerLine.split(","))
                 .map(String::trim)
                 .toList();
 
@@ -78,7 +78,7 @@ public final class CsvValidator {
             throw new ValidationException("CSV is missing gene columns: " + missingGenes);
         }
 
-        return bytes;
+        return file.getBytes();
     }
 
     /** Unchecked domain exception thrown when CSV content violates structure or schema rules. */
