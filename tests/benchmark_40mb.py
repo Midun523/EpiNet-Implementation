@@ -129,7 +129,10 @@ def extract_stage_timings(backend_log_path, ml_log_path, analysis_id):
             m_cf = re.search(r"csv_fetch=([\d\.]+)s", line)
             if m_cf:
                 stages["csv_fetch"] = round(float(m_cf.group(1)), 3)
-        if "STAGE TIMING: compute=" in line:
+            m_comp = re.search(r"compute=([\d\.]+)s", line)
+            if m_comp:
+                stages["compute"] = round(float(m_comp.group(1)), 3)
+        elif stages["compute"] is None and "STAGE TIMING: compute=" in line:
             m_comp = re.search(r"compute=([\d\.]+)s", line)
             if m_comp:
                 stages["compute"] = round(float(m_comp.group(1)), 3)

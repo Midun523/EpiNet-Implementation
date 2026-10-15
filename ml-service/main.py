@@ -45,8 +45,17 @@ from sklearn.linear_model import LinearRegression
 from sklearn.preprocessing import MinMaxScaler
 from starlette.responses import Response
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("uvicorn.error")
+import sys
+
+# Configure logging to write to sys.stdout and to ML_LOG_PATH if set
+ML_LOG_PATH = os.getenv("ML_LOG_PATH")
+handlers = [logging.StreamHandler(sys.stdout)]
+if ML_LOG_PATH:
+    os.makedirs(os.path.dirname(os.path.abspath(ML_LOG_PATH)), exist_ok=True)
+    handlers.append(logging.FileHandler(ML_LOG_PATH, encoding="utf-8"))
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", handlers=handlers, force=True)
+logger = logging.getLogger("epinet.ml")
 
 # ── Prometheus Observability Metrics (Phase 2) ──────────────────────────────
 # WHY: Exposes ML analysis duration histogram, processed jobs counter
@@ -197,7 +206,7 @@ def _validate_and_load(content: bytes) -> tuple[pd.DataFrame, pd.Series, int]:
     return gene_df, phenotype, len(df)
 
 
-def _run_full_analysis(content: bytes) -> dict[str, Any]:
+def _run_full_analysis(content: bytes, analysis_id: Optional[str] = None) -> dict[str, Any]:
     """
     Synchronous function that validates CSV and runs the full epistasis analysis.
     WHY a separate function: called from both the HTTP endpoint and the Kafka
@@ -221,7 +230,7 @@ def _run_full_analysis(content: bytes) -> dict[str, Any]:
             })
     top_pairs = sorted(pairs, key=lambda x: x["score"], reverse=True)[:TOP_PAIRS_COUNT]
     t_compute = time.time() - t0
-    logger.info("STAGE TIMING: compute=%.3fs (rows=%d)", t_compute, rows_processed)
+    logger.info("STAGE TIMING: Job %s compute=%.3fs (rows=%d)", analysis_id, t_compute, rows_processed)
 
     return {
         "genes": EXPECTED_GENES,
@@ -281,7 +290,7 @@ def _fetch_and_analyze(analysis_id: str) -> dict[str, Any]:
     together in the thread pool executor to keep the asyncio loop free.
     """
     csv_bytes = _fetch_csv_from_backend(analysis_id)
-    return _run_full_analysis(csv_bytes)
+    return _run_full_analysis(csv_bytes, analysis_id=analysis_id)
 
 
 # ── Kafka consumer loop ─────────────────────────────────────────────────────
