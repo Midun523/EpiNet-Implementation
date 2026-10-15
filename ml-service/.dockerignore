@@ -1,0 +1,12 @@
+# ml-service/.dockerignore
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+venv/
+.venv/
+.pytest_cache/
+.git/
+.gitignore
+scratch/
+*.log

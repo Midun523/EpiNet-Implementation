@@ -110,63 +110,67 @@ sequenceDiagram
 
 ---
 
-## Quick Start — setup.sh + run.sh
+## Deployment & Development Modes
+
+EpiNet supports two execution workflows: **Fully Containerized (Docker Compose)** for complete production-like staging, and **Host Development Mode** for active local engineering.
+
+---
+
+### Mode 1: Fully Containerized (Docker Compose)
+
+Runs the entire stack in isolated Docker containers with non-root security contexts, resource limits, and automated health checks:
+- **Frontend** (`:5173`) — Nginx unprivileged serving Vite production build & proxying `/api` to backend
+- **Backend** (`:8080`) — Spring Boot on Eclipse Temurin JRE 21 (`-XX:MaxRAMPercentage=75.0`, 1 GB container limit)
+- **ML Service** (`:8000`) — FastAPI on Python 3.12 slim (1 GB container limit)
+- **MySQL 8.0** (`:3307`) — Persistent database with schema migration
+- **Kafka 3.8 (KRaft)** (`:9092` host / `:29092` internal) — Dual listener event broker
+- **Observability** — Prometheus (`:9090`), Grafana (`:3000`), Kafka Exporter (`:9308`)
 
 ```bash
-# 1. Clone
+# 1. Clone repository
 git clone https://github.com/Midun523/epinet-visualizer.git
 cd epinet-visualizer
 
-# 2. Copy env
-cp .env.example .env    # edit MySQL credentials if needed
+# 2. Configure environment variables (no secrets baked into images)
+cp .env.example .env
 
-# 3. Install all deps (idempotent)
-bash setup.sh
+# 3. Build and launch all containerized services
+docker compose down -v                # clean state if resetting
+docker compose up -d --build
 
-# 4. Start everything
-bash run.sh
-# → Frontend  http://localhost:5173
-# → Backend   http://localhost:8080
-# → ML svc    http://localhost:8000
+# 4. Access services:
+# → Frontend:   http://localhost:5173
+# → Backend:    http://localhost:8080
+# → ML Service: http://localhost:8000
+# → Prometheus: http://localhost:9090
+# → Grafana:    http://localhost:3000 (login credentials from .env)
 ```
 
 ---
 
-## Manual Run (per service)
+### Mode 2: Host Development Mode (Local Processes)
 
-### MySQL (Docker)
-```bash
-docker compose up -d --wait mysql
-```
+Run infrastructure dependencies (MySQL, Kafka, Observability) in Docker while running application code directly on the host machine for live debugging and rapid reloading.
 
-### ML Service
 ```bash
+# 1. Start core backing services
+docker compose up -d mysql kafka prometheus grafana kafka-exporter
+
+# 2. Run ML Service (Python venv)
 cd ml-service
-# Linux / macOS:
-source venv/bin/activate
-# Windows PowerShell:
-# .\venv\Scripts\Activate.ps1
+# Linux / macOS: source venv/bin/activate
+# Windows: .\venv\Scripts\Activate.ps1
 uvicorn main:app --reload --port 8000
-```
 
-### Backend (MySQL)
-```bash
+# 3. Run Backend (Spring Boot)
 cd backend
-./mvnw spring-boot:run              # Linux / macOS
-# Windows: .\mvnw.cmd spring-boot:run (or system mvn)
-```
+./mvnw spring-boot:run
+# Or with in-memory H2 fallback (no MySQL/Docker needed):
+# ./mvnw spring-boot:run -Dspring-boot.run.profiles=h2
 
-### Backend — H2 fallback (no Docker needed)
-```bash
-cd backend
-./mvnw spring-boot:run -Dspring-boot.run.profiles=h2   # Linux / macOS
-# Windows: .\mvnw.cmd spring-boot:run -Dspring-boot.run.profiles=h2
-# H2 console: http://localhost:8080/h2-console
-```
-
-### Frontend
-```bash
+# 4. Run Frontend (Vite dev server)
 cd frontend
+npm install
 npm run dev   # http://localhost:5173
 ```
 
@@ -343,7 +347,7 @@ A 5-run benchmark of ~40 MB CSV uploads was conducted against the live, fully in
 | `poll_duration` | 4.764s | 5.704s | 43.482s | 11.552s | 11.367s | 4.764s | 11.367s | 43.482s |
 | **`total_e2e`** | **7.075s** | **8.148s** | **52.238s** | **56.894s** | **13.359s** | **7.075s** | **13.359s** | **56.894s** |
 
-> **Run 3 Timeout & Resilience Fix Note:** During Run 3, MySQL dirty page flushing stalled the backend's status update on WSL2 virtual storage for 33s. The ML worker's initial HTTP GET timed out at 30s (`N/A` for subsequent stages). To prevent permanent job failures from transient disk flush spikes, the ML worker now implements automatic data fetch retries (3 attempts, backoff 2/5/10 s, 60 s timeout per attempt).
+> **Tail Latency & Resilience Note:** up to 45 s observed on one run; likely storage flush stalls under Docker Desktop/WSL2; cause not confirmed. During Run 3, the ML worker's initial HTTP GET timed out at 30s (`N/A` for subsequent stages). To prevent permanent job failures from transient stalls, the ML worker implements automatic data fetch retries (3 attempts, backoff 2/5/10 s, 60 s timeout per attempt).
 
 ---
 

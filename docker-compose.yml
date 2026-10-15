@@ -1,9 +1,10 @@
-# docker-compose.yml — EpiNet Visualizer local infrastructure
-# WHY: provides MySQL for persistence and Kafka for the async analysis event bus.
-# Kafka runs in KRaft mode (no ZooKeeper) to keep the stack simple.
+# docker-compose.yml — EpiNet Visualizer containerized microservices stack (Phase 3)
+# WHY: provides full self-contained orchestration of MySQL, Kafka, Spring Boot backend,
+# FastAPI ML service, React/Nginx frontend, Prometheus, Grafana, and Kafka Exporter.
 
 services:
   mysql:
+    # WHY mysql:8.0: official MySQL 8 container for relational persistence
     image: mysql:8.0
     container_name: epinet-mysql
     restart: unless-stopped
@@ -16,6 +17,7 @@ services:
       - "3307:3306"
     command: --max_allowed_packet=256M
     volumes:
+      # WHY named volume: persists database tables in Docker-managed volume, avoiding Windows bind mount overhead
       - epinet_mysql_data:/var/lib/mysql
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD:-root_pass}"]
@@ -25,26 +27,26 @@ services:
       start_period: 40s
 
   kafka:
-    # WHY KRaft: eliminates ZooKeeper, so one container = one broker.
-    # WHY apache/kafka: official Apache Kafka Docker image with KRaft out of the box.
+    # WHY KRaft: eliminates ZooKeeper, keeping the broker footprint minimal
     image: apache/kafka:3.8.0
     container_name: epinet-kafka
     restart: unless-stopped
     ports:
-      - "9092:9092"   # external listener for host-side services
+      - "9092:9092"   # external listener for host-side tooling and e2e test scripts
     environment:
-      # ── KRaft (no ZooKeeper) ─────────────────────────────────────────
+      # ── KRaft Node Config ──────────────────────────────────────────
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
-      # ── Listeners ────────────────────────────────────────────────────
+      # ── Dual Listeners ─────────────────────────────────────────────
+      # WHY dual listeners: PLAINTEXT (9092) advertises localhost for host scripts,
+      # while INTERNAL (29092) advertises kafka:29092 for inter-container communication
       KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,INTERNAL://0.0.0.0:29092,CONTROLLER://0.0.0.0:9093
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,INTERNAL://kafka:29092
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,INTERNAL:PLAINTEXT
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
-      # ── Topics & Partitions ──────────────────────────────────────────
-      # WHY 3 partitions default: allows scaling consumers in Phase 4/5
+      # ── Topic Partitions & Replication ─────────────────────────────
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
       KAFKA_NUM_PARTITIONS: 3
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
@@ -52,12 +54,83 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
     healthcheck:
-      # WHY: ensures dependent services wait until the broker is accepting connections
       test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"]
       interval: 10s
       timeout: 10s
       retries: 10
       start_period: 15s
+
+  backend:
+    # WHY build ./backend: multi-stage Maven build producing a hardened, non-root Spring Boot container
+    build: ./backend
+    container_name: epinet-backend
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    # WHY mem_limit 1g: enforces cgroup memory ceiling; JVM respects this via -XX:MaxRAMPercentage=75.0
+    mem_limit: 1g
+    environment:
+      # Use compose service names 'mysql' and 'kafka' rather than localhost
+      DB_URL: jdbc:mysql://mysql:3306/${MYSQL_DATABASE:-epinet}?createDatabaseIfNotExist=true&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC&useServerPrepStmts=true
+      DB_USER: ${MYSQL_USER:-epinet}
+      DB_PASS: ${MYSQL_PASSWORD:-epinet_pass}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      ML_SERVICE_URL: http://ml-service:8000
+      ANALYSIS_MODE: ${ANALYSIS_MODE:-kafka}
+    depends_on:
+      mysql:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      # WHY /actuator/health: asserts database connection and Kafka broker are reachable
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/actuator/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 40s
+
+  ml-service:
+    # WHY build ./ml-service: multi-stage Python 3.12 slim container with non-root execution
+    build: ./ml-service
+    container_name: epinet-ml-service
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    # WHY mem_limit 1g: prevents unconstrained CPU/RAM usage during 45-pair epistasis regression
+    mem_limit: 1g
+    environment:
+      # Internal compose service names for backend communication and Kafka consumer loop
+      BACKEND_URL: http://backend:8080
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    depends_on:
+      kafka:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  frontend:
+    # WHY build ./frontend: Vite-built React SPA served via non-root Nginx with reverse proxy to backend
+    build: ./frontend
+    container_name: epinet-frontend
+    restart: unless-stopped
+    ports:
+      - "5173:8080"   # Maps host port 5173 to unprivileged Nginx port 8080
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
   kafka-exporter:
     # WHY danielqsj/kafka-exporter: scrapes Kafka broker consumer group offsets
@@ -82,12 +155,14 @@ services:
       - "9090:9090"
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+    depends_on:
+      backend:
+        condition: service_healthy
+      ml-service:
+        condition: service_healthy
 
   grafana:
     # WHY grafana/grafana: pre-provisioned visualization dashboard for metrics
-    # including request latency, job status gauges, duration, consumer lag, and JVM heap.
     image: grafana/grafana:latest
     container_name: epinet-grafana
     restart: unless-stopped

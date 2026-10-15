@@ -1,0 +1,9 @@
+# backend/.dockerignore
+target/
+.git/
+.gitignore
+.idea/
+*.iml
+.mvn/
+mvnw
+mvnw.cmd

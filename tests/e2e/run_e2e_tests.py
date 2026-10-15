@@ -123,19 +123,39 @@ def start_ml_service():
     proc = subprocess.Popen(cmd, cwd=ML_SERVICE_DIR, env=env, stdout=log_file, stderr=subprocess.STDOUT)
     return proc, log_file
 
-def kill_proc(proc, log_file=None):
-    if proc:
-        try:
-            # On Windows, taskkill /F /T kills child processes (e.g. uvicorn workers, java)
-            subprocess.run(f"taskkill /F /T /PID {proc.pid}", shell=True, capture_output=True)
-            proc.wait(timeout=5)
-        except Exception:
-            pass
-    if log_file:
-        try:
-            log_file.close()
-        except Exception:
-            pass
+CONTAINER_MODE = "--container" in sys.argv or os.getenv("EPINET_CONTAINER_MODE") == "1"
+
+def stop_ml_worker(proc=None, log_file=None):
+    if CONTAINER_MODE:
+        print("  [CONTAINER MODE] Running: docker compose stop ml-service...")
+        subprocess.run(["docker", "compose", "stop", "ml-service"], check=True)
+    else:
+        kill_proc(proc, log_file)
+    time.sleep(2)
+
+def start_ml_worker():
+    if CONTAINER_MODE:
+        print("  [CONTAINER MODE] Running: docker compose start ml-service...")
+        subprocess.run(["docker", "compose", "start", "ml-service"], check=True)
+        return None, None
+    else:
+        return start_ml_service()
+
+def switch_backend_mode(mode="sync"):
+    if CONTAINER_MODE:
+        print(f"  [CONTAINER MODE] Restarting backend container with ANALYSIS_MODE={mode}...")
+        env = os.environ.copy()
+        env["ANALYSIS_MODE"] = mode
+        subprocess.run(["docker", "compose", "up", "-d", "backend"], env=env, check=True)
+        return None, None
+    else:
+        return start_backend(mode)
+
+def stop_backend_worker(proc=None, log_file=None):
+    if CONTAINER_MODE:
+        pass
+    else:
+        kill_proc(proc, log_file)
     time.sleep(2)
 
 def get_kafka_consumer_lag(consumergroup="epinet-ml-service"):
@@ -211,8 +231,12 @@ with open(SAMPLE_CSV_PATH, "rb") as f:
 
 # ─── TEST 1: Happy Path (Kafka) ─────────────────────────────────────────────
 print("\n[TEST 1] Happy Path: Kafka Event-Driven Analysis")
-backend_proc, b_log = start_backend("kafka")
-ml_proc, ml_log = start_ml_service()
+if not CONTAINER_MODE:
+    backend_proc, b_log = start_backend("kafka")
+    ml_proc, ml_log = start_ml_service()
+else:
+    backend_proc, b_log = None, None
+    ml_proc, ml_log = None, None
 
 try:
     print("  Waiting for backend (port 8080) and ML service (port 8000)...")
@@ -259,8 +283,7 @@ try:
     print(f"  Backend job counts before outage: {counts_before}")
 
     print("  Stopping ML worker to simulate crash / offline worker (observability: lag will rise)...")
-    kill_proc(ml_proc, ml_log)
-    time.sleep(2)
+    stop_ml_worker(ml_proc, ml_log)
 
     http_status, upload_resp = upload_file(valid_csv, "recovery_test.csv")
     rec_id = upload_resp["analysisId"]
@@ -280,7 +303,7 @@ try:
     print(f"  [OBSERVABILITY] Backend jobs by status during outage: {counts_during}")
 
     print("  Restarting ML worker to recover queued job (observability: lag will fall to 0)...")
-    ml_proc, ml_log = start_ml_service()
+    ml_proc, ml_log = start_ml_worker()
     assert wait_for_http(f"{ML_URL}/health", 30)
 
     success, transitions, final_st = poll_for_status(rec_id, "COMPLETED", 60)
@@ -349,8 +372,7 @@ except Exception as e:
 print("\n[TEST 4] Dead-Letter Handling: Poison Message -> FAILED via DlqConsumer")
 try:
     print("  Stopping ML service so new job stays in PENDING...")
-    kill_proc(ml_proc, ml_log)
-    time.sleep(2)
+    stop_ml_worker(ml_proc, ml_log)
 
     http_status, upload_resp = upload_file(valid_csv, "dlq_poison_test.csv")
     poison_id = upload_resp["analysisId"]
@@ -372,7 +394,7 @@ try:
         f"Unexpected error message: {final_st.get('errorMessage')}"
 
     print("  Restarting ML worker for large file tests...")
-    ml_proc, ml_log = start_ml_service()
+    ml_proc, ml_log = start_ml_worker()
     assert wait_for_http(f"{ML_URL}/health", 30)
 
     results["test_4_dlq_poison_message"] = {
@@ -484,16 +506,15 @@ except Exception as e:
     results["test_5_large_file_uploads"] = {"status": "FAIL", "error": str(e)}
 
 # ─── Clean up Kafka backend ──────────────────────────────────────────────────
-kill_proc(backend_proc, b_log)
-time.sleep(2)
+stop_backend_worker(backend_proc, b_log)
 
 # ─── TEST 6: analysis.mode=sync ──────────────────────────────────────────────
 print("\n[TEST 6] Sync Path Benchmark Mode: analysis.mode=sync")
-sync_backend_proc, sync_b_log = start_backend("sync")
+sync_backend_proc, sync_b_log = switch_backend_mode("sync")
 
 try:
     print("  Waiting for sync backend to start...")
-    assert wait_for_http(f"{BACKEND_URL}/api/analyses", 30), "Sync backend did not start within 30s"
+    assert wait_for_http(f"{BACKEND_URL}/api/analyses", 60), "Sync backend did not start within 60s"
 
     http_status, upload_resp = upload_file(valid_csv, "sync_mode.csv")
     sync_id = upload_resp["analysisId"]
@@ -520,8 +541,11 @@ except Exception as e:
     print(f"  FAILED: {e}")
     results["test_6_sync_mode"] = {"status": "FAIL", "error": str(e)}
 finally:
-    kill_proc(sync_backend_proc, sync_b_log)
-    kill_proc(ml_proc, ml_log)
+    if CONTAINER_MODE:
+        switch_backend_mode("kafka")
+    else:
+        kill_proc(sync_backend_proc, sync_b_log)
+        kill_proc(ml_proc, ml_log)
 
 print("\n" + "=" * 70)
 print("END-TO-END VALIDATION SUMMARY:")
