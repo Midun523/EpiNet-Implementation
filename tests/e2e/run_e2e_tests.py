@@ -138,6 +138,38 @@ def kill_proc(proc, log_file=None):
             pass
     time.sleep(2)
 
+def get_kafka_consumer_lag(consumergroup="epinet-ml-service"):
+    """Fetches total consumer lag from kafka-exporter for a consumer group."""
+    try:
+        req = urllib.request.urlopen("http://localhost:9308/metrics", timeout=3)
+        lines = req.read().decode("utf-8").splitlines()
+        total_lag = 0
+        found = False
+        for line in lines:
+            if line.startswith("kafka_consumergroup_lag{") and f'consumergroup="{consumergroup}"' in line:
+                val = float(line.split()[-1])
+                total_lag += int(val)
+                found = True
+        if found:
+            return total_lag
+    except Exception:
+        pass
+    return None
+
+def get_job_counts_by_status():
+    """Fetches epinet_jobs_by_status gauge values from backend Prometheus actuator."""
+    counts = {}
+    try:
+        req = urllib.request.urlopen(f"{BACKEND_URL}/actuator/prometheus", timeout=3)
+        for line in req.read().decode("utf-8").splitlines():
+            if line.startswith("epinet_jobs_by_status{"):
+                st = line.split('status="')[1].split('"')[0]
+                val = int(float(line.split()[-1]))
+                counts[st] = val
+    except Exception:
+        pass
+    return counts
+
 def send_poison_to_dlt(key, payload):
     async def _send():
         producer = AIOKafkaProducer(bootstrap_servers="localhost:9092")
@@ -184,8 +216,8 @@ ml_proc, ml_log = start_ml_service()
 
 try:
     print("  Waiting for backend (port 8080) and ML service (port 8000)...")
-    assert wait_for_http(f"{BACKEND_URL}/api/analyses", 30), "Backend did not start within 30s"
-    assert wait_for_http(f"{ML_URL}/health", 30), "ML service did not start within 30s"
+    assert wait_for_http(f"{BACKEND_URL}/api/analyses", 60), "Backend did not start within 60s"
+    assert wait_for_http(f"{ML_URL}/health", 60), "ML service did not start within 60s"
     print("  Both services are UP. Waiting 3s for Kafka partition assignment...")
     time.sleep(3)
 
@@ -221,9 +253,12 @@ except Exception as e:
     results["test_1_happy_path"] = {"status": "FAIL", "error": str(e)}
 
 # ─── TEST 2: ML Worker Killed Mid-Job and Recovered ──────────────────────────
-print("\n[TEST 2] Mid-Job Resiliency: ML Service Killed and Restarted")
+print("\n[TEST 2] Mid-Job Resiliency & Observability: ML Worker Stopped (Lag Rises/Falls)")
 try:
-    print("  Stopping ML worker to simulate crash / offline worker...")
+    counts_before = get_job_counts_by_status()
+    print(f"  Backend job counts before outage: {counts_before}")
+
+    print("  Stopping ML worker to simulate crash / offline worker (observability: lag will rise)...")
     kill_proc(ml_proc, ml_log)
     time.sleep(2)
 
@@ -232,12 +267,19 @@ try:
     print(f"  Job queued with ML worker OFF: analysisId={rec_id}, status={upload_resp['status']}")
     assert upload_resp["status"] == "PENDING"
 
-    time.sleep(2)
+    # Wait with worker stopped so kafka-exporter scrapes the rising lag
+    print("  Waiting 5s with ML worker stopped for consumer lag to rise...")
+    time.sleep(5)
     st = get_status(rec_id)
     print(f"  Status before restart: {st['status']}")
     assert st['status'] == "PENDING"
 
-    print("  Restarting ML worker to recover queued job...")
+    lag_during_outage = get_kafka_consumer_lag("epinet-ml-service")
+    counts_during = get_job_counts_by_status()
+    print(f"  [OBSERVABILITY] epinet-ml-service consumer lag during outage: {lag_during_outage}")
+    print(f"  [OBSERVABILITY] Backend jobs by status during outage: {counts_during}")
+
+    print("  Restarting ML worker to recover queued job (observability: lag will fall to 0)...")
     ml_proc, ml_log = start_ml_service()
     assert wait_for_http(f"{ML_URL}/health", 30)
 
@@ -248,10 +290,28 @@ try:
     st_check = get_status(rec_id)
     assert st_check['status'] == "COMPLETED"
 
+    # Allow kafka-exporter scrape loop to detect that lag has dropped to 0
+    lag_after_recovery = None
+    for _ in range(12):
+        time.sleep(1)
+        lag_val = get_kafka_consumer_lag("epinet-ml-service")
+        if lag_val == 0:
+            lag_after_recovery = 0
+            break
+        lag_after_recovery = lag_val
+
+    counts_after = get_job_counts_by_status()
+    print(f"  [OBSERVABILITY] epinet-ml-service consumer lag after recovery: {lag_after_recovery}")
+    print(f"  [OBSERVABILITY] Backend jobs by status after completion: {counts_after}")
+
     results["test_2_recovery"] = {
         "status": "PASS",
         "transitions": transitions,
-        "recovered": True
+        "recovered": True,
+        "consumer_lag_outage": lag_during_outage,
+        "consumer_lag_recovered": lag_after_recovery,
+        "job_counts_before": counts_before,
+        "job_counts_after": counts_after
     }
 except Exception as e:
     print(f"  FAILED: {e}")

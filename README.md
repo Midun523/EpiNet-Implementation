@@ -287,6 +287,35 @@ npm run build   # exits 0
 
 ---
 
+## Observability & Monitoring (Phase 2)
+
+EpiNet includes an automated observability stack deployed via Docker Compose:
+- **Prometheus** (`:9090`) scrapes metrics from the Spring Boot backend (`:8080/actuator/prometheus`), FastAPI ML service (`:8000/metrics`), `kafka-exporter` (`:9308/metrics`), and Prometheus itself.
+- **Kafka Exporter** (`:9308`) exports consumer group lag and partition offsets.
+- **Grafana** (`:3000`) provides pre-provisioned dashboards with zero manual configuration.
+
+### Accessing Grafana
+1. Open [http://localhost:3000](http://localhost:3000) in your browser.
+2. Log in using the credentials defined in your `.env` file (e.g. `GRAFANA_ADMIN_USER` and `GRAFANA_ADMIN_PASSWORD` from `.env.example`).
+3. Navigate to **Dashboards → EpiNet → EpiNet System Observability**.
+4. The dashboard displays:
+   - **Request Latency (p50 / p95)**
+   - **Jobs by Status** (real-time gauge of `PENDING`, `PROCESSING`, `COMPLETED`, `FAILED` from database)
+   - **Job Duration** (end-to-end duration from creation to terminal state)
+   - **ML Analysis Duration** (statistical regression execution time)
+   - **Kafka Consumer Lag** (`epinet-ml-service` and `epinet-backend` groups)
+   - **JVM Heap Memory** (used, committed, max)
+
+### Metric Verification Status
+All observability metrics and scrape targets were verified during end-to-end testing:
+- **Backend Actuator Metrics**: `epinet_jobs_by_status` (gauge) and `epinet_job_duration_seconds` (timer).
+- **ML Service Metrics**: `epinet_ml_analysis_duration_seconds` (histogram), `epinet_ml_jobs_processed_total` (counter), and `epinet_ml_jobs_in_progress` (gauge).
+- **Kafka Consumer Lag**: `kafka_consumergroup_lag` for `epinet-ml-service` and `epinet-backend`.
+- **Target Health**: All 4 Prometheus scrape targets reporting `UP`.
+- *Unverified metrics*: None — all dashboard metrics were actively tested and confirmed.
+
+---
+
 ## Known Limitations
 
 - **Unauthenticated internal data endpoint**: The internal endpoint `/api/internal/analyses/{id}/data` serves raw CSV bytes to the ML worker without authentication (assumes trusted internal network).

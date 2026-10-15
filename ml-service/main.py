@@ -29,6 +29,7 @@ import io
 import json
 import logging
 import os
+import time
 import urllib.request
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor
@@ -39,11 +40,33 @@ import numpy as np
 import pandas as pd
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
 from sklearn.linear_model import LinearRegression
 from sklearn.preprocessing import MinMaxScaler
+from starlette.responses import Response
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# ── Prometheus Observability Metrics (Phase 2) ──────────────────────────────
+# WHY: Exposes ML analysis duration histogram, processed jobs counter
+# (labelled by status="success" / "failure"), and currently in-progress gauge.
+ANALYSIS_DURATION_SECONDS = Histogram(
+    "epinet_ml_analysis_duration_seconds",
+    "Duration of ML analysis regression computation in seconds",
+    buckets=(0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 15.0, 30.0, 60.0),
+)
+
+JOBS_PROCESSED_TOTAL = Counter(
+    "epinet_ml_jobs_processed_total",
+    "Total count of ML analysis jobs processed",
+    ["status"],
+)
+
+JOBS_IN_PROGRESS = Gauge(
+    "epinet_ml_jobs_in_progress",
+    "Number of ML analysis jobs currently being processed",
+)
 
 # ── Configuration ────────────────────────────────────────────────────────────
 # WHY env vars: lets Docker Compose / Kubernetes override these without editing code.
@@ -218,7 +241,9 @@ def _fetch_csv_from_backend(analysis_id: str) -> bytes:
     url = f"{BACKEND_URL}/api/internal/analyses/{analysis_id}/data"
     req = urllib.request.Request(url)
     try:
-        with urllib.request.urlopen(req, timeout=30) as response:
+        # WHY timeout=120: large 40+ MB CSV transfers from MySQL through backend
+        # need more than 30s under concurrent scrape and database load.
+        with urllib.request.urlopen(req, timeout=120) as response:
             return response.read()
     except urllib.error.HTTPError as e:
         raise ValueError(f"Backend returned HTTP {e.code} when fetching CSV for {analysis_id}")
@@ -334,12 +359,18 @@ async def _kafka_consumer_loop():
                 )
                 continue
 
+            JOBS_IN_PROGRESS.inc()
+            t_start = time.time()
             try:
                 # WHY run_in_executor: scikit-learn regression is CPU-bound.
                 # Running it on the asyncio loop would block /health responses.
                 result = await loop.run_in_executor(
                     _analysis_executor, _fetch_and_analyze, analysis_id
                 )
+                duration = time.time() - t_start
+                ANALYSIS_DURATION_SECONDS.observe(duration)
+                JOBS_PROCESSED_TOTAL.labels(status="success").inc()
+
                 result_json = json.dumps(result)
 
                 completion_event = {
@@ -356,6 +387,10 @@ async def _kafka_consumer_loop():
                 logger.info("Published COMPLETED event for %s", analysis_id)
 
             except Exception as e:
+                duration = time.time() - t_start
+                ANALYSIS_DURATION_SECONDS.observe(duration)
+                JOBS_PROCESSED_TOTAL.labels(status="failure").inc()
+
                 logger.error("Analysis %s failed: %s", analysis_id, str(e), exc_info=True)
 
                 # WHY publish FAILED: if we don't, the job stays PENDING forever
@@ -378,6 +413,8 @@ async def _kafka_consumer_loop():
                         "Could not publish FAILED event for %s: %s",
                         analysis_id, pub_err,
                     )
+            finally:
+                JOBS_IN_PROGRESS.dec()
     except asyncio.CancelledError:
         logger.info("Kafka consumer loop cancelled (shutdown)")
     except Exception as e:
@@ -438,6 +475,18 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/metrics")
+async def metrics() -> Response:
+    """
+    Prometheus metrics endpoint.
+
+    WHY: Exposes Prometheus scrape metrics for the ML service, including
+    epinet_ml_analysis_duration_seconds (histogram), epinet_ml_jobs_processed_total
+    (counter), and epinet_ml_jobs_in_progress (gauge).
+    """
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
 @app.post("/analyze")
 async def analyze(file: UploadFile = File(...)) -> dict[str, Any]:
     """
@@ -454,10 +503,25 @@ async def analyze(file: UploadFile = File(...)) -> dict[str, Any]:
     if len(content) == 0:
         raise HTTPException(status_code=400, detail="Uploaded file is empty.")
 
+    JOBS_IN_PROGRESS.inc()
+    t_start = time.time()
     try:
         # WHY run_in_executor: same CPU-bound reason as the Kafka path.
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(_analysis_executor, _run_full_analysis, content)
+        duration = time.time() - t_start
+        ANALYSIS_DURATION_SECONDS.observe(duration)
+        JOBS_PROCESSED_TOTAL.labels(status="success").inc()
         return result
     except ValueError as e:
+        duration = time.time() - t_start
+        ANALYSIS_DURATION_SECONDS.observe(duration)
+        JOBS_PROCESSED_TOTAL.labels(status="failure").inc()
         raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        duration = time.time() - t_start
+        ANALYSIS_DURATION_SECONDS.observe(duration)
+        JOBS_PROCESSED_TOTAL.labels(status="failure").inc()
+        raise
+    finally:
+        JOBS_IN_PROGRESS.dec()

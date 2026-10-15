@@ -32,14 +32,17 @@ public class AnalysisService {
     private final AnalysisRunRepository repo;
     private final WebClient webClient;
     private final ObjectMapper mapper;
+    private final AnalysisMetrics analysisMetrics;
 
     public AnalysisService(
             AnalysisRunRepository repo,
             ObjectMapper mapper,
-            @Value("${ml.service.url:http://localhost:8000}") String mlUrl
+            @Value("${ml.service.url:http://localhost:8000}") String mlUrl,
+            AnalysisMetrics analysisMetrics
     ) {
         this.repo = repo;
         this.mapper = mapper;
+        this.analysisMetrics = analysisMetrics;
         this.webClient = WebClient.builder()
                 .baseUrl(mlUrl)
                 .codecs(config -> config.defaultCodecs().maxInMemorySize(10 * 1024 * 1024))
@@ -78,9 +81,13 @@ public class AnalysisService {
             // Validate that returned payload is parseable JSON
             mapper.readTree(resultJson);
 
+            LocalDateTime now = LocalDateTime.now();
             run.setResultJson(resultJson);
             run.setStatus(AnalysisRun.Status.COMPLETED);
-            run.setCompletedAt(LocalDateTime.now());
+            run.setCompletedAt(now);
+            if (run.getCreatedAt() != null) {
+                analysisMetrics.recordJobDuration(java.time.Duration.between(run.getCreatedAt(), now), "COMPLETED");
+            }
             log.info("Analysis {} COMPLETED successfully", analysisId);
 
         } catch (WebClientResponseException ex) {
@@ -101,15 +108,23 @@ public class AnalysisService {
                 }
             }
 
+            LocalDateTime now = LocalDateTime.now();
             run.setStatus(AnalysisRun.Status.FAILED);
             run.setErrorMessage(detailMessage);
-            run.setCompletedAt(LocalDateTime.now());
+            run.setCompletedAt(now);
+            if (run.getCreatedAt() != null) {
+                analysisMetrics.recordJobDuration(java.time.Duration.between(run.getCreatedAt(), now), "FAILED");
+            }
 
         } catch (Exception ex) {
             log.error("Analysis {} FAILED with unexpected exception: {}", analysisId, ex.getMessage(), ex);
+            LocalDateTime now = LocalDateTime.now();
             run.setStatus(AnalysisRun.Status.FAILED);
             run.setErrorMessage(ex.getMessage() != null ? ex.getMessage() : "Unknown analysis failure");
-            run.setCompletedAt(LocalDateTime.now());
+            run.setCompletedAt(now);
+            if (run.getCreatedAt() != null) {
+                analysisMetrics.recordJobDuration(java.time.Duration.between(run.getCreatedAt(), now), "FAILED");
+            }
         }
 
         repo.save(run);

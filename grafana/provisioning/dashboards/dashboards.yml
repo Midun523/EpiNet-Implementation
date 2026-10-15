@@ -1,0 +1,13 @@
+# WHY: Automatically loads dashboards from the local provisioning folder on Grafana start.
+apiVersion: 1
+
+providers:
+  - name: 'EpiNet Dashboards'
+    orgId: 1
+    folder: 'EpiNet'
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 10
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/provisioning/dashboards

@@ -5,3 +5,4 @@ numpy==1.26.4
 scikit-learn==1.5.2
 python-multipart==0.0.9
 aiokafka==0.11.0
+prometheus_client==0.26.0

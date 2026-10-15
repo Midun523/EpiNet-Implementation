@@ -29,9 +29,11 @@ public class DlqConsumer {
     private static final Logger log = LoggerFactory.getLogger(DlqConsumer.class);
 
     private final AnalysisRunRepository repo;
+    private final com.epinet.service.AnalysisMetrics analysisMetrics;
 
-    public DlqConsumer(AnalysisRunRepository repo) {
+    public DlqConsumer(AnalysisRunRepository repo, com.epinet.service.AnalysisMetrics analysisMetrics) {
         this.repo = repo;
+        this.analysisMetrics = analysisMetrics;
     }
 
     @KafkaListener(topics = "analysis.completed.DLT", groupId = "epinet-backend-dlq")
@@ -60,11 +62,15 @@ public class DlqConsumer {
             return;
         }
 
+        LocalDateTime now = LocalDateTime.now();
         run.setStatus(AnalysisRun.Status.FAILED);
         run.setErrorMessage("Message processing failed after retries (dead-letter)");
-        run.setCompletedAt(LocalDateTime.now());
+        run.setCompletedAt(now);
         run.setCsvData(null);
         repo.save(run);
+        if (run.getCreatedAt() != null) {
+            analysisMetrics.recordJobDuration(java.time.Duration.between(run.getCreatedAt(), now), "FAILED");
+        }
         log.warn("DLT: marked job {} as FAILED", analysisId);
     }
 }

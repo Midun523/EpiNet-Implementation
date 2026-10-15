@@ -1,0 +1,27 @@
+# WHY: Prometheus scrape configuration for EpiNet system observability (Phase 2).
+# Scrapes the Spring Boot backend, FastAPI ML service, Kafka lag exporter, and Prometheus itself.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  - job_name: "epinet-backend"
+    metrics_path: "/actuator/prometheus"
+    scrape_interval: 3s
+    static_configs:
+      - targets: ["host.docker.internal:8080"]
+
+  - job_name: "epinet-ml-service"
+    metrics_path: "/metrics"
+    scrape_interval: 3s
+    static_configs:
+      - targets: ["host.docker.internal:8000"]
+
+  - job_name: "kafka-exporter"
+    scrape_interval: 3s
+    static_configs:
+      - targets: ["kafka-exporter:9308"]

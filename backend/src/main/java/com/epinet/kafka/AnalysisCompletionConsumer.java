@@ -37,10 +37,16 @@ public class AnalysisCompletionConsumer {
 
     private final AnalysisRunRepository repo;
     private final ObjectMapper mapper;
+    private final com.epinet.service.AnalysisMetrics analysisMetrics;
 
-    public AnalysisCompletionConsumer(AnalysisRunRepository repo, ObjectMapper mapper) {
+    public AnalysisCompletionConsumer(
+            AnalysisRunRepository repo,
+            ObjectMapper mapper,
+            com.epinet.service.AnalysisMetrics analysisMetrics
+    ) {
         this.repo = repo;
         this.mapper = mapper;
+        this.analysisMetrics = analysisMetrics;
     }
 
     @KafkaListener(topics = "analysis.completed", groupId = "epinet-backend")
@@ -79,6 +85,9 @@ public class AnalysisCompletionConsumer {
 
         LocalDateTime now = LocalDateTime.now();
         run.setCompletedAt(now);
+        java.time.Duration duration = run.getCreatedAt() != null
+                ? java.time.Duration.between(run.getCreatedAt(), now)
+                : null;
 
         if ("COMPLETED".equalsIgnoreCase(status)) {
             String resultJson = (String) event.get("resultJson");
@@ -87,6 +96,7 @@ public class AnalysisCompletionConsumer {
             run.setErrorMessage(null);
             run.setCsvData(null); // free up blob memory once job is complete
             repo.saveAndFlush(run);
+            analysisMetrics.recordJobDuration(duration, "COMPLETED");
             log.info("Job {} marked COMPLETED via Kafka event", analysisId);
 
         } else if ("FAILED".equalsIgnoreCase(status)) {
@@ -95,6 +105,7 @@ public class AnalysisCompletionConsumer {
             run.setErrorMessage(errorMessage != null ? errorMessage : "Analysis failed");
             run.setCsvData(null);
             repo.saveAndFlush(run);
+            analysisMetrics.recordJobDuration(duration, "FAILED");
             log.warn("Job {} marked FAILED via Kafka event: {}", analysisId, errorMessage);
 
         } else {
