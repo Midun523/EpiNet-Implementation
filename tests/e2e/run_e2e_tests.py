@@ -1,12 +1,15 @@
 """
-End-to-end test runner for EpiNet Phase 1 verification.
-Tests 4 core scenarios:
+End-to-end test runner for EpiNet Phase 1 verification against compose MySQL and Kafka.
+Tests core scenarios:
 1. Happy path: Kafka async flow (upload -> PENDING -> PROCESSING -> COMPLETED -> result)
-2. Mid-job failure & recovery: ML service stopped mid-processing, restarted, completes job; verified idempotency skips already finalized job.
+2. Mid-job failure & recovery: ML service stopped mid-processing, restarted, completes job; verified idempotency.
 3. Malformed data: Non-numeric CSV content -> ML service catches error, emits FAILED event -> backend marks FAILED.
-4. Synchronous mode: analysis.mode=sync -> direct HTTP flow (@Async + WebClient) -> COMPLETED.
+4. Dead-Letter Topic (DLQ): Poison message into analysis.completed.DLT -> verified job marked FAILED via DlqConsumer.
+5. Large file uploads: ~10 MB and ~40 MB CSV uploads measured for latency and success, plus max file size validation.
+6. Synchronous mode: analysis.mode=sync -> direct HTTP flow (@Async + WebClient) -> COMPLETED.
 """
 
+import asyncio
 import json
 import os
 import subprocess
@@ -14,6 +17,10 @@ import sys
 import time
 import urllib.request
 import urllib.parse
+import urllib.error
+from aiokafka import AIOKafkaProducer
+
+sys.stdout.reconfigure(line_buffering=True)
 
 BACKEND_JAR = os.path.abspath("backend/target/epinet-backend-1.0.0.jar")
 ML_SERVICE_DIR = os.path.abspath("ml-service")
@@ -21,6 +28,7 @@ SAMPLE_CSV_PATH = os.path.abspath("sample-data/sample_pharmacogenomics.csv")
 BACKEND_URL = "http://localhost:8080"
 ML_URL = "http://localhost:8000"
 
+os.makedirs("scratch", exist_ok=True)
 results = {}
 
 def wait_for_http(url, timeout=30):
@@ -48,8 +56,15 @@ def upload_file(csv_bytes, filename="test.csv"):
         headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
         method="POST"
     )
-    with urllib.request.urlopen(req) as resp:
-        return resp.status, json.loads(resp.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            return resp.status, json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        content = e.read().decode("utf-8")
+        try:
+            return e.code, json.loads(content)
+        except Exception:
+            return e.code, {"error": content}
 
 def get_status(analysis_id):
     req = urllib.request.Request(f"{BACKEND_URL}/api/analyses/{analysis_id}/status")
@@ -75,9 +90,9 @@ def poll_for_status(analysis_id, expected_terminal, timeout=60):
                 return True, seen_statuses, st
             if status_name in ("COMPLETED", "FAILED") and status_name != expected_terminal:
                 return False, seen_statuses, st
-        except Exception as e:
+        except Exception:
             pass
-        time.sleep(0.03)
+        time.sleep(0.05)
     return False, seen_statuses, {}
 
 def start_backend(mode="kafka"):
@@ -85,9 +100,12 @@ def start_backend(mode="kafka"):
     env["ANALYSIS_MODE"] = mode
     env["KAFKA_BOOTSTRAP_SERVERS"] = "localhost:9092"
     env["ML_SERVICE_URL"] = "http://localhost:8000"
+    env["DB_URL"] = "jdbc:mysql://localhost:3307/epinet?createDatabaseIfNotExist=true&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC"
+    env["DB_USER"] = "epinet"
+    env["DB_PASS"] = "epinet_pass"
     cmd = [
         "java", "-jar", BACKEND_JAR,
-        "--spring.profiles.active=h2",
+        "--spring.profiles.active=mysql",
         f"--analysis.mode={mode}",
         "--server.port=8080"
     ]
@@ -119,8 +137,40 @@ def kill_proc(proc, log_file=None):
             pass
     time.sleep(2)
 
+def send_poison_to_dlt(key, payload):
+    async def _send():
+        producer = AIOKafkaProducer(bootstrap_servers="localhost:9092")
+        await producer.start()
+        try:
+            val_bytes = payload.encode("utf-8") if isinstance(payload, str) else json.dumps(payload).encode("utf-8")
+            key_bytes = key.encode("utf-8") if isinstance(key, str) else key
+            await producer.send_and_wait("analysis.completed.DLT", key=key_bytes, value=val_bytes)
+        finally:
+            await producer.stop()
+
+    asyncio.run(_send())
+
+def generate_csv_bytes(target_mb):
+    with open(SAMPLE_CSV_PATH, "rb") as f:
+        lines = f.readlines()
+    header = lines[0]
+    data_lines = lines[1:]
+    block = b"".join(data_lines)
+    target_bytes = int(target_mb * 1024 * 1024)
+    needed = target_bytes - len(header)
+    num_blocks = needed // len(block)
+    rem = needed % len(block)
+    chunks = [header]
+    chunks.extend([block] * num_blocks)
+    if rem > 0:
+        part = block[:rem]
+        last_nl = part.rfind(b"\n")
+        if last_nl != -1:
+            chunks.append(part[:last_nl + 1])
+    return b"".join(chunks)
+
 print("=" * 70)
-print("RUNNING EPINET PHASE 1 END-TO-END VALIDATION SUITE")
+print("RUNNING EPINET PHASE 1 END-TO-END VALIDATION SUITE (MYSQL + KAFKA)")
 print("=" * 70)
 
 with open(SAMPLE_CSV_PATH, "rb") as f:
@@ -172,7 +222,6 @@ except Exception as e:
 # ─── TEST 2: ML Worker Killed Mid-Job and Recovered ──────────────────────────
 print("\n[TEST 2] Mid-Job Resiliency: ML Service Killed and Restarted")
 try:
-    # Stop ML service so job queues in Kafka as PENDING
     print("  Stopping ML worker to simulate crash / offline worker...")
     kill_proc(ml_proc, ml_log)
     time.sleep(2)
@@ -182,13 +231,11 @@ try:
     print(f"  Job queued with ML worker OFF: analysisId={rec_id}, status={upload_resp['status']}")
     assert upload_resp["status"] == "PENDING"
 
-    # Status remains PENDING while worker is offline
     time.sleep(2)
     st = get_status(rec_id)
     print(f"  Status before restart: {st['status']}")
     assert st['status'] == "PENDING"
 
-    # Now restart ML service: it connects to Kafka, receives queued event, and completes it
     print("  Restarting ML worker to recover queued job...")
     ml_proc, ml_log = start_ml_service()
     assert wait_for_http(f"{ML_URL}/health", 30)
@@ -197,7 +244,6 @@ try:
     print(f"  Recovered job status: {final_st.get('status')} | Transitions: {' -> '.join(transitions)}")
     assert success, f"Recovered job did not complete. Seen: {transitions}"
 
-    # Also test idempotency: terminal status is verified
     st_check = get_status(rec_id)
     assert st_check['status'] == "COMPLETED"
 
@@ -213,7 +259,6 @@ except Exception as e:
 # ─── TEST 3: Malformed CSV -> FAILED ─────────────────────────────────────────
 print("\n[TEST 3] Error Handling: Malformed CSV -> FAILED")
 try:
-    # Valid header, but invalid non-numeric floats in data columns
     malformed_csv = (
         "sample_id,CYP2D6,CYP2C19,CYP3A4,CYP2C9,VKORC1,SLCO1B1,TPMT,DPYD,UGT1A1,ABCB1,phenotype\n"
         "SAMPLE_001,not_a_float,0.28,0.35,0.95,0.95,0.85,0.16,0.72,0.05,0.13,3.66\n"
@@ -239,12 +284,131 @@ except Exception as e:
     print(f"  FAILED: {e}")
     results["test_3_malformed_csv"] = {"status": "FAIL", "error": str(e)}
 
+# ─── TEST 4: Dead-Letter Topic (DLQ) Poison Message ──────────────────────────
+print("\n[TEST 4] Dead-Letter Handling: Poison Message -> FAILED via DlqConsumer")
+try:
+    print("  Stopping ML service so new job stays in PENDING...")
+    kill_proc(ml_proc, ml_log)
+    time.sleep(2)
+
+    http_status, upload_resp = upload_file(valid_csv, "dlq_poison_test.csv")
+    poison_id = upload_resp["analysisId"]
+    print(f"  Job created for DLQ verification: analysisId={poison_id}, status={upload_resp['status']}")
+    assert upload_resp["status"] == "PENDING"
+
+    print(f"  Publishing poison message directly into 'analysis.completed.DLT' for analysisId={poison_id}...")
+    poison_payload = json.dumps({
+        "error": "Simulated poison message: deserialization failed after 3 retries",
+        "corrupted": True
+    })
+    send_poison_to_dlt(poison_id, poison_payload)
+
+    print("  Polling status for DLQ consumer processing...")
+    success, transitions, final_st = poll_for_status(poison_id, "FAILED", 30)
+    print(f"  Final status: {final_st.get('status')} | Error: {final_st.get('errorMessage')}")
+    assert success, f"Expected FAILED status via DlqConsumer, got transitions: {transitions}"
+    assert final_st.get("errorMessage") == "Message processing failed after retries (dead-letter)", \
+        f"Unexpected error message: {final_st.get('errorMessage')}"
+
+    print("  Restarting ML worker for large file tests...")
+    ml_proc, ml_log = start_ml_service()
+    assert wait_for_http(f"{ML_URL}/health", 30)
+
+    results["test_4_dlq_poison_message"] = {
+        "status": "PASS",
+        "final_status": final_st.get("status"),
+        "error_message": final_st.get("errorMessage"),
+        "transitions": transitions
+    }
+except Exception as e:
+    print(f"  FAILED: {e}")
+    results["test_4_dlq_poison_message"] = {"status": "FAIL", "error": str(e)}
+
+# ─── TEST 5: Large File Upload Stress Test (~10 MB, ~40 MB, and Max Size) ────
+print("\n[TEST 5] Large File Upload Stress Test: ~10 MB, ~40 MB CSVs, and Max Size Boundary")
+try:
+    # 1. Test ~10 MB Upload
+    print("  Generating ~10 MB CSV in-memory...")
+    t0 = time.time()
+    csv_10mb = generate_csv_bytes(10)
+    size_10mb = len(csv_10mb)
+    print(f"  Generated {size_10mb / (1024*1024):.2f} MB ({size_10mb} bytes) in {time.time() - t0:.3f}s")
+
+    print("  Uploading ~10 MB CSV...")
+    t_up_10 = time.time()
+    http_status_10, resp_10 = upload_file(csv_10mb, "upload_10mb.csv")
+    upload_10mb_sec = round(time.time() - t_up_10, 3)
+    id_10mb = resp_10["analysisId"]
+    print(f"  Uploaded in {upload_10mb_sec}s: HTTP {http_status_10}, analysisId={id_10mb}")
+    assert http_status_10 == 202
+
+    print("  Waiting for ~10 MB analysis to complete...")
+    t_proc_10 = time.time()
+    success_10, transitions_10, final_st_10 = poll_for_status(id_10mb, "COMPLETED", 90)
+    proc_10mb_sec = round(time.time() - t_proc_10, 3)
+    print(f"  10 MB job completed in {proc_10mb_sec}s! Status: {final_st_10.get('status')}")
+    assert success_10, f"10 MB job did not complete: {transitions_10}"
+
+    # 2. Test ~40 MB Upload
+    print("  Generating ~40 MB CSV in-memory...")
+    t0 = time.time()
+    csv_40mb = generate_csv_bytes(40)
+    size_40mb = len(csv_40mb)
+    print(f"  Generated {size_40mb / (1024*1024):.2f} MB ({size_40mb} bytes) in {time.time() - t0:.3f}s")
+
+    print("  Uploading ~40 MB CSV...")
+    t_up_40 = time.time()
+    http_status_40, resp_40 = upload_file(csv_40mb, "upload_40mb.csv")
+    upload_40mb_sec = round(time.time() - t_up_40, 3)
+    assert http_status_40 == 202, f"Expected 202, got {http_status_40}: {resp_40}"
+    id_40mb = resp_40["analysisId"]
+    print(f"  Uploaded in {upload_40mb_sec}s: HTTP {http_status_40}, analysisId={id_40mb}")
+
+    print("  Waiting for ~40 MB analysis to complete...")
+    t_proc_40 = time.time()
+    success_40, transitions_40, final_st_40 = poll_for_status(id_40mb, "COMPLETED", 120)
+    proc_40mb_sec = round(time.time() - t_proc_40, 3)
+    print(f"  40 MB job completed in {proc_40mb_sec}s! Status: {final_st_40.get('status')}")
+    assert success_40, f"40 MB job did not complete: {transitions_40}"
+
+    # 3. Test boundary rejection (>50 MB, e.g. ~52 MB)
+    print("  Testing size limit boundary with ~52 MB CSV (configured max is 50 MB)...")
+    csv_52mb = generate_csv_bytes(52)
+    http_status_52, resp_52 = upload_file(csv_52mb, "upload_52mb.csv")
+    print(f"  Boundary upload response: HTTP {http_status_52}, body={resp_52}")
+    assert http_status_52 in (400, 413, 500), f"Expected rejection (400/413/500), got {http_status_52}"
+
+    results["test_5_large_file_uploads"] = {
+        "status": "PASS",
+        "10mb": {
+            "size_bytes": size_10mb,
+            "upload_duration_sec": upload_10mb_sec,
+            "processing_duration_sec": proc_10mb_sec,
+            "final_status": final_st_10.get("status")
+        },
+        "40mb": {
+            "size_bytes": size_40mb,
+            "upload_duration_sec": upload_40mb_sec,
+            "processing_duration_sec": proc_40mb_sec,
+            "final_status": final_st_40.get("status")
+        },
+        "boundary_check": {
+            "tested_size_mb": 52,
+            "http_status": http_status_52,
+            "rejected_as_expected": True
+        },
+        "real_max_file_size": "50 MB (52,428,800 bytes, enforced by spring.servlet.multipart.max-file-size=50MB & CsvValidator; MySQL max_allowed_packet=256M)"
+    }
+except Exception as e:
+    print(f"  FAILED: {e}")
+    results["test_5_large_file_uploads"] = {"status": "FAIL", "error": str(e)}
+
 # ─── Clean up Kafka backend ──────────────────────────────────────────────────
 kill_proc(backend_proc, b_log)
 time.sleep(2)
 
-# ─── TEST 4: analysis.mode=sync ──────────────────────────────────────────────
-print("\n[TEST 4] Sync Path Benchmark Mode: analysis.mode=sync")
+# ─── TEST 6: analysis.mode=sync ──────────────────────────────────────────────
+print("\n[TEST 6] Sync Path Benchmark Mode: analysis.mode=sync")
 sync_backend_proc, sync_b_log = start_backend("sync")
 
 try:
@@ -266,7 +430,7 @@ try:
     assert len(sync_result.get("genes", [])) == 10
     print(f"  Sync result fetched successfully: {len(sync_result['genes'])} genes, {len(sync_result['top_pairs'])} top pairs")
 
-    results["test_4_sync_mode"] = {
+    results["test_6_sync_mode"] = {
         "status": "PASS",
         "initial_status": init_status,
         "final_status": final_st.get("status"),
@@ -274,7 +438,7 @@ try:
     }
 except Exception as e:
     print(f"  FAILED: {e}")
-    results["test_4_sync_mode"] = {"status": "FAIL", "error": str(e)}
+    results["test_6_sync_mode"] = {"status": "FAIL", "error": str(e)}
 finally:
     kill_proc(sync_backend_proc, sync_b_log)
     kill_proc(ml_proc, ml_log)

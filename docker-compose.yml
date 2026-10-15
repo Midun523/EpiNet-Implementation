@@ -13,52 +13,51 @@ services:
       MYSQL_USER: ${MYSQL_USER:-epinet}
       MYSQL_PASSWORD: ${MYSQL_PASSWORD:-epinet_pass}
     ports:
-      - "3306:3306"
-    command: --max_allowed_packet=64M
+      - "3307:3306"
+    command: --max_allowed_packet=256M
     volumes:
       - epinet_mysql_data:/var/lib/mysql
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD:-root_pass}"]
       interval: 10s
       timeout: 5s
-      retries: 5
+      retries: 10
+      start_period: 40s
 
   kafka:
     # WHY KRaft: eliminates ZooKeeper, so one container = one broker.
-    # WHY bitnami: well-maintained image with clean KRaft env-var support.
-    image: bitnami/kafka:3.8
+    # WHY apache/kafka: official Apache Kafka Docker image with KRaft out of the box.
+    image: apache/kafka:3.8.0
     container_name: epinet-kafka
     restart: unless-stopped
     ports:
       - "9092:9092"   # external listener for host-side services
     environment:
       # ── KRaft (no ZooKeeper) ─────────────────────────────────────────
-      - KAFKA_CFG_NODE_ID=1
-      - KAFKA_CFG_PROCESS_ROLES=broker,controller
-      - KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=1@kafka:9093
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
       # ── Listeners ────────────────────────────────────────────────────
-      # INTERNAL  → other Docker containers connect on kafka:9094
-      # EXTERNAL  → host machine connects on localhost:9092
-      # CONTROLLER→ KRaft internal raft protocol on :9093
-      - KAFKA_CFG_LISTENERS=INTERNAL://:9094,EXTERNAL://:9092,CONTROLLER://:9093
-      - KAFKA_CFG_ADVERTISED_LISTENERS=INTERNAL://kafka:9094,EXTERNAL://localhost:9092
-      - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
-      - KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER
-      - KAFKA_CFG_INTER_BROKER_LISTENER_NAME=INTERNAL
-      # ── Topics ───────────────────────────────────────────────────────
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      # ── Topics & Partitions ──────────────────────────────────────────
       # WHY 3 partitions default: allows scaling consumers in Phase 4/5
-      - KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE=true
-      - KAFKA_CFG_NUM_PARTITIONS=3
-    volumes:
-      - epinet_kafka_data:/bitnami/kafka
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
     healthcheck:
       # WHY: ensures dependent services wait until the broker is accepting connections
-      test: ["CMD-SHELL", "kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"]
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"]
       interval: 10s
       timeout: 10s
       retries: 10
-      start_period: 30s
+      start_period: 15s
 
 volumes:
   epinet_mysql_data:
-  epinet_kafka_data:

@@ -35,7 +35,7 @@ public class AnalysisRun {
 
     /** Full ML JSON payload; stored as LONGTEXT in MySQL, CLOB in H2. */
     @Lob
-    @Column(name = "result_json")
+    @Column(name = "result_json", columnDefinition = "LONGTEXT")
     private String resultJson;
 
     @Column(name = "error_message")
@@ -47,7 +47,7 @@ public class AnalysisRun {
      * service fetches the data via GET /api/internal/analyses/{id}/data.
      */
     @Lob
-    @Column(name = "csv_data")
+    @Column(name = "csv_data", columnDefinition = "LONGBLOB")
     private byte[] csvData;
 
     @Column(name = "created_at", nullable = false)
