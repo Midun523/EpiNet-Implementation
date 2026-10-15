@@ -349,6 +349,42 @@ A 5-run benchmark of ~40 MB CSV uploads was conducted against the live, fully in
 
 > **Tail Latency & Resilience Note:** up to 45 s observed on one run; likely storage flush stalls under Docker Desktop/WSL2; cause not confirmed. During Run 3, the ML worker's initial HTTP GET timed out at 30s (`N/A` for subsequent stages). To prevent permanent job failures from transient stalls, the ML worker implements automatic data fetch retries (3 attempts, backoff 2/5/10 s, 60 s timeout per attempt).
 
+### Container-Mode 40 MB Benchmark (Docker Compose)
+
+A 5-run benchmark was conducted against the fully containerized Compose stack running under cgroup memory limits (`backend: 1.5g`, `ml-service: 1g`).
+
+- **Date:** 2026-10-15
+- **Machine Type:** Laptop (x86_64, Windows 11, Docker Desktop with WSL2 backend)
+- **Sample Size:** 5 consecutive runs
+- **Dataset:** ~40.00 MB CSV (377,864 rows, synthetic data repeating sample pharmacogenomics rows)
+- **Container Limits & Sizing:** `backend: 1.5g` (`-XX:MaxRAMPercentage=75.0`), `ml-service: 1g`, MySQL 8.0.46 (`innodb_buffer_pool_size=512M`, `innodb_redo_log_capacity=256M`).
+
+#### Stage Timing Breakdown (Extracted from Real Container Logs)
+
+| Stage | Run 1 | Run 2 | Run 3 | Run 4 | Run 5 | Min | Median | Max |
+|---|---|---|---|---|---|---|---|---|
+| `client_upload` | 2.045s | 3.700s | 26.725s | 1.614s | 1.616s | 1.614s | 2.045s | 26.725s |
+| `upload_to_published` | 1.618s | 3.217s | 24.338s | 1.318s | 1.251s | 1.251s | 1.618s | 24.338s |
+| &nbsp;&nbsp;↳ `multipart_recv` | 0.000s | 0.000s | 0.000s | 0.000s | 0.000s | 0.000s | 0.000s | 0.000s |
+| &nbsp;&nbsp;↳ `csv_validate` | 0.070s | 0.169s | 0.126s | 0.045s | 0.075s | 0.045s | 0.075s | 0.169s |
+| &nbsp;&nbsp;↳ `entity_build` | 0.001s | 0.003s | 0.044s | 0.000s | 0.001s | 0.000s | 0.001s | 0.044s |
+| &nbsp;&nbsp;↳ `db_insert` | 1.423s | 3.030s | 24.167s | 1.272s | 1.174s | 1.174s | 1.423s | 24.167s |
+| &nbsp;&nbsp;↳ `kafka_publish` | 0.124s | 0.015s | 0.001s | 0.001s | 0.001s | 0.001s | 0.001s | 0.124s |
+| `queue_wait` | 0.047s | 0.011s | 0.016s | 0.013s | 0.007s | 0.007s | 0.013s | 0.047s |
+| `csv_fetch` | 2.144s | 1.214s | 1.123s | 1.628s | 1.699s | 1.123s | 1.628s | 2.144s |
+| `compute` | 4.400s | 4.594s | 4.246s | 5.037s | 4.877s | 4.246s | 4.594s | 5.037s |
+| `result_write_back` | 0.010s | 0.004s | 0.007s | 0.003s | 0.010s | 0.003s | 0.007s | 0.010s |
+| `poll_duration` | 9.146s | 7.354s | 7.801s | 8.704s | 8.120s | 7.354s | 8.120s | 9.146s |
+| **`total_e2e`** | **11.191s** | **11.054s** | **34.525s** | **10.318s** | **9.736s** | **9.736s** | **11.054s** | **34.525s** |
+
+#### Container Resource & Memory Findings
+- **Backend Memory Sweet Spot**: Comparing 1g, 1.5g, and 2g backend limits, 1.5g achieved the best performance (median `total_e2e` **11.054s** vs 61.898s at 1g). Under 1g, JVM heap is constrained to ~750 MB, causing frequent G1 humongous allocations and GC pauses. At 1.5g, JVM heap expands to ~1.15 GB, reducing GC pause duration to 0.034s–0.158s per job with zero OOM terminations (`OOMKilled: false`).
+- **Peak Container Memory (1.5g limit)**:
+  - `epinet-backend`: 1.50 GiB peak (99.98% of 1.5 GiB cgroup limit, 0 OOM kills)
+  - `epinet-ml-service`: 304.1 MiB peak (29.70% of 1 GiB limit, 0 OOM kills)
+  - `epinet-mysql`: 1.06 GiB peak
+- **Redo Log Capacity**: Setting MySQL `--innodb_redo_log_capacity=256M` (up from default 100 MB) prevents InnoDB checkpoint exhaustion stalls during back-to-back 40 MB transactions.
+
 ---
 
 ## Data Retention & Lifecycle

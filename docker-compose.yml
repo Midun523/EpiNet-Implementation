@@ -4,8 +4,8 @@
 
 services:
   mysql:
-    # WHY mysql:8.0: official MySQL 8 container for relational persistence
-    image: mysql:8.0
+    # WHY mysql:8.0.46: pinned official MySQL 8 container for relational persistence
+    image: mysql:8.0.46
     container_name: epinet-mysql
     restart: unless-stopped
     environment:
@@ -15,7 +15,12 @@ services:
       MYSQL_PASSWORD: ${MYSQL_PASSWORD:-epinet_pass}
     ports:
       - "3307:3306"
-    command: --max_allowed_packet=256M
+    command:
+      - --max_allowed_packet=256M
+      # WHY innodb_buffer_pool_size 512M: provides sufficient in-memory page caching for 40 MB blob transactions
+      - --innodb_buffer_pool_size=512M
+      # WHY innodb_redo_log_capacity 256M: avoids log checkpointer exhaustion stalls during consecutive 40 MB inserts
+      - --innodb_redo_log_capacity=256M
     volumes:
       # WHY named volume: persists database tables in Docker-managed volume, avoiding Windows bind mount overhead
       - epinet_mysql_data:/var/lib/mysql
@@ -67,8 +72,9 @@ services:
     restart: unless-stopped
     ports:
       - "8080:8080"
-    # WHY mem_limit 1g: enforces cgroup memory ceiling; JVM respects this via -XX:MaxRAMPercentage=75.0
-    mem_limit: 1g
+    # WHY mem_limit 1.5g: empirical benchmark sweet spot (median total_e2e 11.05s vs 61.9s at 1g);
+    # provides ~1.15 GB JVM heap under -XX:MaxRAMPercentage=75.0, preventing humongous allocation stalls
+    mem_limit: 1.5g
     environment:
       # Use compose service names 'mysql' and 'kafka' rather than localhost
       DB_URL: jdbc:mysql://mysql:3306/${MYSQL_DATABASE:-epinet}?createDatabaseIfNotExist=true&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC&useServerPrepStmts=true
@@ -133,9 +139,9 @@ services:
       start_period: 10s
 
   kafka-exporter:
-    # WHY danielqsj/kafka-exporter: scrapes Kafka broker consumer group offsets
+    # WHY danielqsj/kafka-exporter:v1.10.0: pinned container scraping Kafka broker consumer group offsets
     # to export consumer lag metrics (kafka_consumergroup_lag) for Prometheus.
-    image: danielqsj/kafka-exporter:latest
+    image: danielqsj/kafka-exporter:v1.10.0
     container_name: epinet-kafka-exporter
     restart: unless-stopped
     command: ["--kafka.server=kafka:29092"]
@@ -146,9 +152,9 @@ services:
         condition: service_healthy
 
   prometheus:
-    # WHY prom/prometheus: time-series metrics store scraping backend,
+    # WHY prom/prometheus:v3.15.0: pinned time-series metrics store scraping backend,
     # ML service, kafka-exporter, and itself for Phase 2 observability.
-    image: prom/prometheus:latest
+    image: prom/prometheus:v3.15.0
     container_name: epinet-prometheus
     restart: unless-stopped
     ports:
@@ -162,8 +168,8 @@ services:
         condition: service_healthy
 
   grafana:
-    # WHY grafana/grafana: pre-provisioned visualization dashboard for metrics
-    image: grafana/grafana:latest
+    # WHY grafana/grafana:13.2.4: pinned visualization dashboard for metrics
+    image: grafana/grafana:13.2.4
     container_name: epinet-grafana
     restart: unless-stopped
     ports:
