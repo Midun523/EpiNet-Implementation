@@ -289,10 +289,10 @@ npm run build   # exits 0
 
 ## Known Limitations
 
-- **Unauthenticated internal `/data` endpoint**: `/api/internal/analyses/{id}/data` serves CSV bytes to the ML worker without token authentication or mutual TLS (assumes trusted internal network).
-- **PENDING → PROCESSING transition occurs inside a GET request**: The state transition from `PENDING` to `PROCESSING` is triggered when the ML worker fetches the CSV data via `GET /api/internal/analyses/{id}/data`, coupling a read endpoint with a state mutation.
-- **DLT test publishes directly into the dead-letter topic**: The E2E test validates `DlqConsumer` by publishing directly into `analysis.completed.DLT` rather than simulating 3 consumer retries.
-- **Synthetic benchmark data**: Large-file benchmarks (~10 MB and ~40 MB) replicate diverse sample rows from the synthetic pharmacogenomics dataset to ensure non-zero variance; production genomic cohorts may have differing variance and missingness.
+- **Unauthenticated internal data endpoint**: The internal endpoint `/api/internal/analyses/{id}/data` serves raw CSV bytes to the ML worker without authentication (assumes trusted internal network).
+- **PENDING → PROCESSING happens inside a GET**: In Kafka mode, the transition from `PENDING` to `PROCESSING` is triggered when the ML worker fetches the CSV via `GET /api/internal/analyses/{id}/data`, coupling a read endpoint with a state mutation.
+- **DLT test publishes directly into the dead-letter topic**: The dead-letter queue test publishes directly into `analysis.completed.DLT` rather than simulating exhausted consumer retries.
+- **Benchmark data is synthetic**: The benchmark datasets (~10 MB and ~40 MB) use repeated rows from the synthetic pharmacogenomics sample dataset.
 - **Fixed Gene Schema**: Input datasets must match the 10 pharmacogenomic genes and phenotype columns defined in the schema.
 - **Upload Limit**: Enforced at 50 MB (`spring.servlet.multipart.max-file-size=50MB`, `CsvValidator`, and MySQL `--max_allowed_packet=256M`).
 
