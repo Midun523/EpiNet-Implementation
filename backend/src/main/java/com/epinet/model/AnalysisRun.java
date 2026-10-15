@@ -3,11 +3,17 @@ package com.epinet.model;
 import jakarta.persistence.*;
 import java.time.LocalDateTime;
 
+import org.hibernate.annotations.DynamicUpdate;
+
 /**
  * JPA entity representing one pharmacogenomic analysis run.
  * Stores the full ML result as JSON for retrieval without re-running.
+ *
+ * WHY @DynamicUpdate: Prevents Hibernate from including unchanged columns (especially
+ * the large csv_data blob) in generated UPDATE SQL statements.
  */
 @Entity
+@DynamicUpdate
 @Table(name = "analysis_run")
 public class AnalysisRun {
 

@@ -91,22 +91,23 @@ public class AnalysisCompletionConsumer {
 
         if ("COMPLETED".equalsIgnoreCase(status)) {
             String resultJson = (String) event.get("resultJson");
-            run.setStatus(AnalysisRun.Status.COMPLETED);
-            run.setResultJson(resultJson);
-            run.setErrorMessage(null);
-            run.setCsvData(null); // free up blob memory once job is complete
-            repo.saveAndFlush(run);
+            long tSaveStart = System.currentTimeMillis();
+            // WHY markCompleted: targeted UPDATE statement setting status, resultJson,
+            // completedAt, and clearing csvData to NULL without rewriting blob bytes.
+            repo.markCompleted(analysisId, resultJson, now);
+            long tSaveEnd = System.currentTimeMillis();
             analysisMetrics.recordJobDuration(duration, "COMPLETED");
-            log.info("Job {} marked COMPLETED via Kafka event", analysisId);
+            log.info("STAGE TIMING: Job {} marked COMPLETED in MySQL (db_update took {} ms)",
+                    analysisId, (tSaveEnd - tSaveStart));
 
         } else if ("FAILED".equalsIgnoreCase(status)) {
             String errorMessage = (String) event.get("errorMessage");
-            run.setStatus(AnalysisRun.Status.FAILED);
-            run.setErrorMessage(errorMessage != null ? errorMessage : "Analysis failed");
-            run.setCsvData(null);
-            repo.saveAndFlush(run);
+            long tSaveStart = System.currentTimeMillis();
+            repo.markFailed(analysisId, errorMessage != null ? errorMessage : "Analysis failed", now);
+            long tSaveEnd = System.currentTimeMillis();
             analysisMetrics.recordJobDuration(duration, "FAILED");
-            log.warn("Job {} marked FAILED via Kafka event: {}", analysisId, errorMessage);
+            log.warn("STAGE TIMING: Job {} marked FAILED in MySQL: {} (db_update took {} ms)",
+                    analysisId, errorMessage, (tSaveEnd - tSaveStart));
 
         } else {
             log.warn("Unknown status '{}' in analysis.completed for job {}", status, analysisId);

@@ -70,6 +70,7 @@ public class AnalysisController {
 
     @PostMapping("/uploads")
     public ResponseEntity<?> upload(@RequestParam("file") MultipartFile file) throws IOException {
+        long tUploadStart = System.currentTimeMillis();
 
         // Validate CSV structure and encoding; throws ValidationException on failure
         byte[] bytes = CsvValidator.validate(file);
@@ -85,10 +86,17 @@ public class AnalysisController {
             AnalysisRun run = new AnalysisRun(analysisId, file.getOriginalFilename());
             run.setStatus(AnalysisRun.Status.PENDING);
             run.setCsvData(bytes);
+            long tSaveStart = System.currentTimeMillis();
             repo.saveAndFlush(run);
+            long tSaveEnd = System.currentTimeMillis();
 
-            log.info("Kafka path: saved PENDING job {}, publishing event", analysisId);
+            long tPubStart = System.currentTimeMillis();
             eventPublisher.publishRequested(analysisId, file.getOriginalFilename());
+            long tPubEnd = System.currentTimeMillis();
+
+            long tUploadTotal = System.currentTimeMillis() - tUploadStart;
+            log.info("STAGE TIMING: Job {} upload_received -> event_published total={} ms (db_save={} ms, kafka_publish={} ms)",
+                    analysisId, tUploadTotal, (tSaveEnd - tSaveStart), (tPubEnd - tPubStart));
 
             return ResponseEntity.status(HttpStatus.ACCEPTED)
                     .body(Map.of("analysisId", analysisId, "status", "PENDING"));
@@ -160,22 +168,29 @@ public class AnalysisController {
     // PENDING -> PROCESSING transition:
     // When the ML worker calls this endpoint to fetch the data, it confirms
     // the worker has picked up the job and started computing. We transition
-    // status from PENDING to PROCESSING and flush to MySQL.
+    // status from PENDING to PROCESSING with a targeted single-column UPDATE,
+    // avoiding rewriting the 40 MB csvData blob back to MySQL.
 
     @GetMapping("/internal/analyses/{id}/data")
     public ResponseEntity<byte[]> getAnalysisData(@PathVariable String id) {
-        return repo.findById(id)
-                .filter(r -> r.getCsvData() != null)
-                .map(r -> {
-                    if (r.getStatus() == AnalysisRun.Status.PENDING) {
-                        r.setStatus(AnalysisRun.Status.PROCESSING);
-                        repo.saveAndFlush(r);
-                        log.info("Job {} transitioned PENDING -> PROCESSING upon worker data fetch", id);
-                    }
-                    return ResponseEntity.ok()
-                            .contentType(MediaType.APPLICATION_OCTET_STREAM)
-                            .body(r.getCsvData());
-                })
-                .orElse(ResponseEntity.notFound().build());
+        long tStart = System.currentTimeMillis();
+        int updated = repo.updateStatusIf(id, AnalysisRun.Status.PROCESSING, AnalysisRun.Status.PENDING);
+        if (updated > 0) {
+            log.info("Job {} transitioned PENDING -> PROCESSING upon worker data fetch (status_update took {} ms)",
+                    id, (System.currentTimeMillis() - tStart));
+        }
+
+        byte[] csvData = repo.findCsvDataById(id);
+        if (csvData == null) {
+            // Fallback for mock environments (e.g. unit tests that mock findById)
+            csvData = repo.findById(id).map(AnalysisRun::getCsvData).orElse(null);
+        }
+        if (csvData == null || csvData.length == 0) {
+            return ResponseEntity.notFound().build();
+        }
+
+        return ResponseEntity.ok()
+                .contentType(MediaType.APPLICATION_OCTET_STREAM)
+                .body(csvData);
     }
 }

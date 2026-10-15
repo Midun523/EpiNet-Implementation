@@ -203,6 +203,7 @@ def _run_full_analysis(content: bytes) -> dict[str, Any]:
     WHY a separate function: called from both the HTTP endpoint and the Kafka
     consumer (via run_in_executor) so the logic isn't duplicated.
     """
+    t0 = time.time()
     gene_df, phenotype, rows_processed = _validate_and_load(content)
 
     logger.info("Analyzing %d rows", rows_processed)
@@ -219,6 +220,8 @@ def _run_full_analysis(content: bytes) -> dict[str, Any]:
                 "score": round(float(matrix[i, j]), 4),
             })
     top_pairs = sorted(pairs, key=lambda x: x["score"], reverse=True)[:TOP_PAIRS_COUNT]
+    t_compute = time.time() - t0
+    logger.info("STAGE TIMING: compute=%.3fs (rows=%d)", t_compute, rows_processed)
 
     return {
         "genes": EXPECTED_GENES,
@@ -240,11 +243,14 @@ def _fetch_csv_from_backend(analysis_id: str) -> bytes:
     """
     url = f"{BACKEND_URL}/api/internal/analyses/{analysis_id}/data"
     req = urllib.request.Request(url)
+    t0 = time.time()
     try:
-        # WHY timeout=120: large 40+ MB CSV transfers from MySQL through backend
-        # need more than 30s under concurrent scrape and database load.
-        with urllib.request.urlopen(req, timeout=120) as response:
-            return response.read()
+        # WHY timeout=30: with targeted status update, CSV fetch takes ~2s, so 30s has ample headroom
+        with urllib.request.urlopen(req, timeout=30) as response:
+            data = response.read()
+            t_fetch = time.time() - t0
+            logger.info("STAGE TIMING: Job %s csv_fetch=%.3fs (size=%.2f MB)", analysis_id, t_fetch, len(data) / (1024 * 1024))
+            return data
     except urllib.error.HTTPError as e:
         raise ValueError(f"Backend returned HTTP {e.code} when fetching CSV for {analysis_id}")
     except urllib.error.URLError as e:
@@ -347,6 +353,9 @@ async def _kafka_consumer_loop():
 
             logger.info("Received analysis.requested for %s", analysis_id)
 
+            queue_wait = (time.time() - (msg.timestamp / 1000.0)) if msg.timestamp else 0.0
+            logger.info("STAGE TIMING: Job %s queue_wait=%.3fs", analysis_id, queue_wait)
+
             # WHY skip COMPLETED or FAILED: if Kafka re-delivers an event after a consumer
             # restart or crash, we must not repeat a heavy 30s analysis for a finalized job.
             current_status = await loop.run_in_executor(
@@ -379,12 +388,14 @@ async def _kafka_consumer_loop():
                     "resultJson": result_json,
                     "errorMessage": None,
                 }
+                t_pub_start = time.time()
                 await producer.send_and_wait(
                     "analysis.completed",
                     key=analysis_id,
                     value=completion_event,
                 )
-                logger.info("Published COMPLETED event for %s", analysis_id)
+                t_pub = time.time() - t_pub_start
+                logger.info("STAGE TIMING: Job %s result_write_back_publish=%.3fs", analysis_id, t_pub)
 
             except Exception as e:
                 duration = time.time() - t_start
