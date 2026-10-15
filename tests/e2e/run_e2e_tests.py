@@ -12,6 +12,7 @@ Tests core scenarios:
 import asyncio
 import json
 import os
+import statistics
 import subprocess
 import sys
 import time
@@ -324,11 +325,11 @@ except Exception as e:
     print(f"  FAILED: {e}")
     results["test_4_dlq_poison_message"] = {"status": "FAIL", "error": str(e)}
 
-# ─── TEST 5: Large File Upload Stress Test (~10 MB, ~40 MB, and Max Size) ────
-print("\n[TEST 5] Large File Upload Stress Test: ~10 MB, ~40 MB CSVs, and Max Size Boundary")
+# ─── TEST 5: Large File Upload Stress Test ───────────────────────────────────
+print("\n[TEST 5] Large File Upload Stress Test: synthetic data (sample rows repeated)")
 try:
     # 1. Test ~10 MB Upload
-    print("  Generating ~10 MB CSV in-memory...")
+    print("  Generating ~10 MB CSV in-memory (synthetic data: sample rows repeated)...")
     t0 = time.time()
     csv_10mb = generate_csv_bytes(10)
     size_10mb = len(csv_10mb)
@@ -338,9 +339,9 @@ try:
     t_up_10 = time.time()
     http_status_10, resp_10 = upload_file(csv_10mb, "upload_10mb.csv")
     upload_10mb_sec = round(time.time() - t_up_10, 3)
+    assert http_status_10 == 202, f"Expected 202, got {http_status_10}: {resp_10}"
     id_10mb = resp_10["analysisId"]
     print(f"  Uploaded in {upload_10mb_sec}s: HTTP {http_status_10}, analysisId={id_10mb}")
-    assert http_status_10 == 202
 
     print("  Waiting for ~10 MB analysis to complete...")
     t_proc_10 = time.time()
@@ -349,37 +350,53 @@ try:
     print(f"  10 MB job completed in {proc_10mb_sec}s! Status: {final_st_10.get('status')}")
     assert success_10, f"10 MB job did not complete: {transitions_10}"
 
-    # 2. Test ~40 MB Upload
-    print("  Generating ~40 MB CSV in-memory...")
+    # 2. Test ~40 MB Upload - Run 3 times to measure min / median / max
+    print("\n  Benchmarking ~40 MB CSV (running 3 iterations to measure min/median/max analysis time)...")
     t0 = time.time()
     csv_40mb = generate_csv_bytes(40)
     size_40mb = len(csv_40mb)
-    print(f"  Generated {size_40mb / (1024*1024):.2f} MB ({size_40mb} bytes) in {time.time() - t0:.3f}s")
+    print(f"  Generated 40 MB synthetic dataset ({size_40mb / (1024*1024):.2f} MB, {size_40mb} bytes) in {time.time() - t0:.3f}s")
 
-    print("  Uploading ~40 MB CSV...")
-    t_up_40 = time.time()
-    http_status_40, resp_40 = upload_file(csv_40mb, "upload_40mb.csv")
-    upload_40mb_sec = round(time.time() - t_up_40, 3)
-    assert http_status_40 == 202, f"Expected 202, got {http_status_40}: {resp_40}"
-    id_40mb = resp_40["analysisId"]
-    print(f"  Uploaded in {upload_40mb_sec}s: HTTP {http_status_40}, analysisId={id_40mb}")
+    runs_40mb = []
+    for iteration in range(1, 4):
+        print(f"    [Iteration {iteration}/3] Uploading ~40 MB CSV...")
+        t_up_40 = time.time()
+        http_status_40, resp_40 = upload_file(csv_40mb, f"upload_40mb_run{iteration}.csv")
+        up_sec = round(time.time() - t_up_40, 3)
+        assert http_status_40 == 202, f"Expected 202, got {http_status_40}: {resp_40}"
+        run_id = resp_40["analysisId"]
 
-    print("  Waiting for ~40 MB analysis to complete...")
-    t_proc_40 = time.time()
-    success_40, transitions_40, final_st_40 = poll_for_status(id_40mb, "COMPLETED", 120)
-    proc_40mb_sec = round(time.time() - t_proc_40, 3)
-    print(f"  40 MB job completed in {proc_40mb_sec}s! Status: {final_st_40.get('status')}")
-    assert success_40, f"40 MB job did not complete: {transitions_40}"
+        t_proc_40 = time.time()
+        success_40, transitions_40, final_st_40 = poll_for_status(run_id, "COMPLETED", 120)
+        proc_sec = round(time.time() - t_proc_40, 3)
+        assert success_40, f"Iteration {iteration} did not complete: {transitions_40}"
+        print(f"    [Iteration {iteration}/3] Upload: {up_sec}s | Analysis: {proc_sec}s | Status: {final_st_40.get('status')}")
+        runs_40mb.append({
+            "iteration": iteration,
+            "upload_duration_sec": up_sec,
+            "analysis_duration_sec": proc_sec
+        })
+
+    analysis_times = [r["analysis_duration_sec"] for r in runs_40mb]
+    min_40mb = round(min(analysis_times), 3)
+    max_40mb = round(max(analysis_times), 3)
+    med_40mb = round(statistics.median(analysis_times), 3)
+    print(f"  40 MB Analysis Summary (3 runs): Min={min_40mb}s, Median={med_40mb}s, Max={max_40mb}s")
 
     # 3. Test boundary rejection (>50 MB, e.g. ~52 MB)
-    print("  Testing size limit boundary with ~52 MB CSV (configured max is 50 MB)...")
+    print("\n  Testing size limit boundary with ~52 MB CSV (configured max is 50 MB)...")
     csv_52mb = generate_csv_bytes(52)
     http_status_52, resp_52 = upload_file(csv_52mb, "upload_52mb.csv")
     print(f"  Boundary upload response: HTTP {http_status_52}, body={resp_52}")
     assert http_status_52 in (400, 413, 500), f"Expected rejection (400/413/500), got {http_status_52}"
+    err_body_str = str(resp_52)
+    assert "50 MB upload limit" in err_body_str or "50MB upload limit" in err_body_str, \
+        f"Expected '50 MB upload limit' in response text, got: {err_body_str}"
+    print(f"  Confirmed exact error message contains '50 MB upload limit': {err_body_str}")
 
     results["test_5_large_file_uploads"] = {
         "status": "PASS",
+        "dataset_type": "synthetic data (sample rows repeated)",
         "10mb": {
             "size_bytes": size_10mb,
             "upload_duration_sec": upload_10mb_sec,
@@ -388,13 +405,16 @@ try:
         },
         "40mb": {
             "size_bytes": size_40mb,
-            "upload_duration_sec": upload_40mb_sec,
-            "processing_duration_sec": proc_40mb_sec,
-            "final_status": final_st_40.get("status")
+            "iterations": runs_40mb,
+            "analysis_time_min_sec": min_40mb,
+            "analysis_time_median_sec": med_40mb,
+            "analysis_time_max_sec": max_40mb,
+            "final_status": "COMPLETED"
         },
         "boundary_check": {
             "tested_size_mb": 52,
             "http_status": http_status_52,
+            "response_body": resp_52,
             "rejected_as_expected": True
         },
         "real_max_file_size": "50 MB (52,428,800 bytes, enforced by spring.servlet.multipart.max-file-size=50MB & CsvValidator; MySQL max_allowed_packet=256M)"

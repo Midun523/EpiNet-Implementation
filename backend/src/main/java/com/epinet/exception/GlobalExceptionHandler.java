@@ -19,6 +19,9 @@ public class GlobalExceptionHandler {
 
     private static final Logger log = LoggerFactory.getLogger(GlobalExceptionHandler.class);
 
+    @org.springframework.beans.factory.annotation.Value("${spring.servlet.multipart.max-file-size:50MB}")
+    private String maxFileSize;
+
     @ExceptionHandler(CsvValidator.ValidationException.class)
     public ResponseEntity<Map<String, String>> handleValidation(CsvValidator.ValidationException ex) {
         return ResponseEntity.badRequest().body(Map.of("error", ex.getMessage()));
@@ -26,8 +29,11 @@ public class GlobalExceptionHandler {
 
     @ExceptionHandler(MaxUploadSizeExceededException.class)
     public ResponseEntity<Map<String, String>> handleMaxSize(MaxUploadSizeExceededException ex) {
+        String formattedLimit = maxFileSize.toUpperCase().endsWith("MB")
+                ? maxFileSize.substring(0, maxFileSize.length() - 2) + " MB"
+                : maxFileSize;
         return ResponseEntity.status(HttpStatus.PAYLOAD_TOO_LARGE)
-                .body(Map.of("error", "File exceeds the 5 MB upload limit."));
+                .body(Map.of("error", "File exceeds the " + formattedLimit + " upload limit."));
     }
 
     @ExceptionHandler(Exception.class)

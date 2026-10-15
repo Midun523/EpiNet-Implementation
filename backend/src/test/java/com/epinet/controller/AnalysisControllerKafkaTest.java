@@ -36,6 +36,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
  */
 @WebMvcTest(AnalysisController.class)
 @TestPropertySource(properties = "analysis.mode=kafka")
+@org.springframework.test.context.ActiveProfiles("test")
 class AnalysisControllerKafkaTest {
 
     @Autowired
