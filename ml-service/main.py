@@ -244,26 +244,52 @@ def _run_full_analysis(content: bytes, analysis_id: Optional[str] = None) -> dic
     }
 
 
-def _fetch_csv_from_backend(analysis_id: str) -> bytes:
+def _fetch_csv_from_backend(
+    analysis_id: str,
+    max_attempts: int = 3,
+    backoffs: tuple[int, ...] = (2, 5, 10),
+    timeout: int = 60,
+) -> bytes:
     """
     WHY: Kafka messages only carry the analysisId (not CSV data) to stay under
     Kafka's 1 MB message limit. This fetches the CSV bytes from the backend's
-    internal endpoint using stdlib urllib (no extra dependency needed).
+    internal endpoint using stdlib urllib.
+
+    Resilience: Retries up to max_attempts (default 3) with backoff (default 2/5/10 s)
+    and a 60s timeout per attempt to gracefully absorb transient disk/DB flush stalls
+    in the backend before publishing a FAILED event.
     """
     url = f"{BACKEND_URL}/api/internal/analyses/{analysis_id}/data"
     req = urllib.request.Request(url)
+    last_error: Optional[Exception] = None
     t0 = time.time()
-    try:
-        # WHY timeout=30: with targeted status update, CSV fetch takes ~2s, so 30s has ample headroom
-        with urllib.request.urlopen(req, timeout=30) as response:
-            data = response.read()
-            t_fetch = time.time() - t0
-            logger.info("STAGE TIMING: Job %s csv_fetch=%.3fs (size=%.2f MB)", analysis_id, t_fetch, len(data) / (1024 * 1024))
-            return data
-    except urllib.error.HTTPError as e:
-        raise ValueError(f"Backend returned HTTP {e.code} when fetching CSV for {analysis_id}")
-    except urllib.error.URLError as e:
-        raise ValueError(f"Cannot reach backend at {url}: {e.reason}")
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as response:
+                data = response.read()
+                t_fetch = time.time() - t0
+                logger.info(
+                    "STAGE TIMING: Job %s csv_fetch=%.3fs (size=%.2f MB)",
+                    analysis_id, t_fetch, len(data) / (1024 * 1024),
+                )
+                return data
+        except Exception as e:
+            last_error = e
+            if attempt < max_attempts:
+                sleep_sec = backoffs[attempt - 1] if attempt - 1 < len(backoffs) else backoffs[-1]
+                logger.warning(
+                    "Fetch attempt %d/%d failed for job %s: %s. Retrying in %ds...",
+                    attempt, max_attempts, analysis_id, e, sleep_sec,
+                )
+                time.sleep(sleep_sec)
+            else:
+                logger.error(
+                    "Fetch attempt %d/%d failed for job %s: %s. All retries exhausted.",
+                    attempt, max_attempts, analysis_id, e,
+                )
+
+    raise ValueError(f"Failed to fetch CSV for {analysis_id} after {max_attempts} attempts: {last_error}")
 
 
 def _fetch_status_from_backend(analysis_id: str) -> Optional[str]:

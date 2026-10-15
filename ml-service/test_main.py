@@ -196,3 +196,47 @@ def test_recovers_planted_epistatic_pairs():
         if (p[0], p[1]) in pair_tuples or (p[1], p[0]) in pair_tuples
     )
     assert recovered == 3, f"Expected all 3 planted pairs in top 5, got {pair_tuples}"
+
+
+# ──────────────────────────────────────────────
+# Fetch CSV Retry Resilience
+# ──────────────────────────────────────────────
+
+def test_fetch_csv_retry_succeeds_after_one_failure():
+    """Verify that _fetch_csv_from_backend retries on transient failure and succeeds on 2nd attempt."""
+    import urllib.error
+    from unittest.mock import MagicMock, patch
+    from main import _fetch_csv_from_backend
+
+    mock_resp = MagicMock()
+    mock_resp.read.return_value = b"sample_id,CYP2D6,phenotype\nS1,0.5,1.0\n"
+    mock_resp.__enter__.return_value = mock_resp
+    mock_resp.__exit__.return_value = False
+
+    side_effects = [
+        urllib.error.URLError("timed out"),
+        mock_resp,
+    ]
+
+    with patch("urllib.request.urlopen", side_effect=side_effects) as mock_urlopen, \
+         patch("time.sleep") as mock_sleep:
+        data = _fetch_csv_from_backend("test-job-uuid-123", max_attempts=3, backoffs=(2, 5, 10), timeout=60)
+        assert data == b"sample_id,CYP2D6,phenotype\nS1,0.5,1.0\n"
+        assert mock_urlopen.call_count == 2
+        mock_sleep.assert_called_once_with(2)
+
+
+def test_fetch_csv_fails_after_exhausting_all_retries():
+    """Verify that _fetch_csv_from_backend raises ValueError after 3 failed attempts."""
+    import urllib.error
+    from unittest.mock import patch
+    from main import _fetch_csv_from_backend
+
+    with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("connection refused")) as mock_urlopen, \
+         patch("time.sleep") as mock_sleep:
+        with pytest.raises(ValueError, match="Failed to fetch CSV for test-job-uuid-456 after 3 attempts"):
+            _fetch_csv_from_backend("test-job-uuid-456", max_attempts=3, backoffs=(2, 5, 10), timeout=60)
+        assert mock_urlopen.call_count == 3
+        assert mock_sleep.call_count == 2
+        assert mock_sleep.call_args_list == [((2,),), ((5,),)]
+

@@ -255,8 +255,8 @@ Running the analysis on the sample dataset demonstrates that EpiNet Visualizer a
 ```bash
 cd ml-service
 pytest -v
-# 17 tests: health, shape, symmetry, diagonal, range, determinism,
-#           sample size / variance checks, and planted-pair recovery
+# 19 tests: health, shape, symmetry, diagonal, range, determinism,
+#           sample size / variance checks, planted-pair recovery, and fetch retry resilience
 ```
 
 ### Backend (Maven)
@@ -313,6 +313,37 @@ All observability metrics and scrape targets were verified during end-to-end tes
 - **Kafka Consumer Lag**: `kafka_consumergroup_lag` for `epinet-ml-service` and `epinet-backend`.
 - **Target Health**: All 4 Prometheus scrape targets reporting `UP`.
 - *Unverified metrics*: None — all dashboard metrics were actively tested and confirmed.
+
+---
+
+## Performance & 40 MB Benchmark
+
+A 5-run benchmark of ~40 MB CSV uploads was conducted against the live, fully integrated system (Spring Boot backend, MySQL 8.0, Apache Kafka 3.8, and FastAPI ML worker).
+
+- **Date:** 2026-10-15
+- **Machine Type:** Laptop (x86_64, Windows 11, Docker Desktop with WSL2 backend)
+- **Sample Size:** 5 consecutive runs
+- **Dataset:** ~40.00 MB CSV (377,864 rows, synthetic data repeating sample pharmacogenomics rows)
+
+### Stage Timing Breakdown (Extracted from Real Logs)
+
+| Stage | Run 1 | Run 2 | Run 3 | Run 4 | Run 5 | Min | Median | Max |
+|---|---|---|---|---|---|---|---|---|
+| `client_upload` | 2.310s | 2.444s | 8.755s | 45.341s | 1.992s | 1.992s | 2.444s | 45.341s |
+| `upload_to_published` | 1.961s | 2.075s | 8.384s | 45.082s | 1.767s | 1.767s | 2.075s | 45.082s |
+| &nbsp;&nbsp;↳ `multipart_recv` | 0.000s | 0.000s | 0.000s | 0.000s | 0.000s | 0.000s | 0.000s | 0.000s |
+| &nbsp;&nbsp;↳ `csv_validate` | 0.030s | 0.016s | 0.046s | 0.030s | 0.031s | 0.016s | 0.030s | 0.046s |
+| &nbsp;&nbsp;↳ `entity_build` | 0.000s | 0.000s | 0.000s | 0.000s | 0.000s | 0.000s | 0.000s | 0.000s |
+| &nbsp;&nbsp;↳ `db_insert` | 1.931s | 2.049s | 8.338s | 45.065s | 1.737s | 1.737s | 2.049s | 45.065s |
+| &nbsp;&nbsp;↳ `kafka_publish` | 0.000s | 0.010s | 0.000s | 0.000s | 0.111s | 0.000s | 0.000s | 0.111s |
+| `queue_wait` | 0.073s | 0.004s | 0.019s | 0.005s | 0.019s | 0.004s | 0.019s | 0.073s |
+| `csv_fetch` | 0.967s | 0.512s | *N/A* | 6.128s | 0.899s | 0.512s | 0.933s | 6.128s |
+| `compute` | 3.068s | 3.419s | *N/A* | 2.828s | 2.942s | 2.828s | 3.068s | 3.419s |
+| `result_write_back` | 0.240s | 0.237s | *N/A* | 4.139s | 3.905s | 0.237s | 0.240s | 4.139s |
+| `poll_duration` | 4.764s | 5.704s | 43.482s | 11.552s | 11.367s | 4.764s | 11.367s | 43.482s |
+| **`total_e2e`** | **7.075s** | **8.148s** | **52.238s** | **56.894s** | **13.359s** | **7.075s** | **13.359s** | **56.894s** |
+
+> **Run 3 Timeout & Resilience Fix Note:** During Run 3, MySQL dirty page flushing stalled the backend's status update on WSL2 virtual storage for 33s. The ML worker's initial HTTP GET timed out at 30s (`N/A` for subsequent stages). To prevent permanent job failures from transient disk flush spikes, the ML worker now implements automatic data fetch retries (3 attempts, backoff 2/5/10 s, 60 s timeout per attempt).
 
 ---
 
