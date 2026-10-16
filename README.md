@@ -517,28 +517,44 @@ Conditions A1 and A2 are the same configuration (1.5 GB backend, 256M redo) yet 
    Docker Desktop built-in Kubernetes was not enabled on the host (`kubectl config get-contexts` returned empty). `kind` (Kubernetes in Docker) v0.27.0 with node image `kindest/node:v1.32.2` was chosen because it allows declarative, reproducible cluster configuration committed directly to the repository (`k8s/kind-config.yaml`).
 2. **Stateful Infrastructure Split:**
    MySQL and Kafka remain managed in Docker Compose. Running stateless application pods in Kubernetes while keeping relational and messaging brokers in Compose minimizes cluster memory footprint (kind node uses ~695 MiB, MySQL ~780 MiB, Kafka ~330 MiB, leaving > 5.5 GiB free headroom in the Docker VM). Unneeded observability services (`prometheus`, `grafana`, `kafka-exporter`) are stopped during cluster runs.
-3. **Cross-Boundary Networking & Kafka Triple Listeners:**
-   - **Bridge Gateway Routing**: Kind pods communicate with Compose services via `host.docker.internal`, mapped to the kind bridge network gateway IPv4 (`172.19.0.1`) via pod `hostAliases`.
+3. **Cross-Boundary Networking & Dynamic Gateway Discovery:**
+   - **Dynamic Gateway Discovery**: Kind pods communicate with Compose services via `host.docker.internal`. Rather than hard-coding `172.19.0.1`, `python k8s/generate-secrets.py` queries `docker network inspect kind` at deploy time, extracts the actual IPv4 bridge gateway assigned by the local Docker daemon, and templates it from `k8s/backend-deployment.template.yaml` and `k8s/ml-service-deployment.template.yaml` into the manifests applied by `kubectl`.
    - **Kafka Listener Architecture**:
      * `PLAINTEXT://localhost:9092`: Host scripts and e2e test runners.
      * `INTERNAL://kafka:29092`: Compose inter-service traffic.
      * `K8S://host.docker.internal:9094`: Kubernetes cluster pods connecting via the bridge gateway.
 4. **Empirically Measured Resource Requests & Limits:**
-   - `backend`: Requests `cpu: 250m, memory: 1Gi`; Limits `cpu: 1500m, memory: 2Gi`. JVM configured with `-XX:MaxRAMPercentage=70.0 -XX:+UseG1GC` (~1430 MB heap). Under consecutive 40 MB uploads, container RSS reaches ~1.55 GiB due to Metaspace, Tomcat multipart buffers, thread stacks, and G1GC native memory; a 2Gi limit prevents kernel `OOMKilled` (exit code 137).
+   - `backend`: Requests `cpu: 250m, memory: 1Gi`; Limits `cpu: 1500m, memory: 2Gi`. JVM configured with `-XX:MaxRAMPercentage=70.0 -XX:+UseG1GC` (~1430 MB heap). Under consecutive 40 MB uploads, container RSS reaches ~1.55 GiB due to Metaspace, Tomcat multipart buffers, thread stacks, and G1GC native memory; a 2Gi limit prevents kernel `OOMKilled` (exit code 137, verified empirically when 1.5Gi limit caused OOM termination).
    - `ml-service`: Requests `cpu: 250m, memory: 350Mi`; Limits `cpu: 1500m, memory: 1Gi`.
    - `frontend`: Requests `cpu: 50m, memory: 32Mi`; Limits `cpu: 250m, memory: 128Mi`.
-5. **Horizontal Pod Autoscaling (HPA):**
-   Metrics-server deployed with `--kubelet-insecure-tls` to scrape kindlet nodes. HPAs target 60% CPU utilization for backend and ml-service (1 to 4 replicas).
-6. **Secrets Management:**
-   `k8s/secret.template.yaml` is committed as a reference template. Real credentials are generated locally from `.env` via `python k8s/generate-secrets.py` into `k8s/secret.yaml`, which is strictly ignored by git (`.gitignore`).
+5. **Horizontal Pod Autoscaling (HPA) & VM Memory Sizing:**
+   Metrics-server deployed with `--kubelet-insecure-tls` to scrape kindlet nodes. HPAs target 60% CPU utilization:
+   - **ML Service (`maxReplicas: 3`)**: Aligned strictly with the 3 partitions of topic `analysis.requested`. Additional replicas beyond 3 would remain permanently idle in the Kafka consumer group.
+   - **Backend (`maxReplicas: 1`)**: Pinned to 1 replica to strictly guarantee memory safety in the 7.57 GiB Docker VM:
+     * Compose Infrastructure: MySQL 8 (~1.05 GiB) + Kafka 3.8 (~820 MiB) = ~1.87 GiB
+     * K8s Control Plane & Metrics-Server: ~750 MiB
+     * Infrastructure Subtotal: ~2.62 GiB (leaving ~4.95 GiB for application workloads)
+     * ML Service Max Allocation: 3 replicas × 1.0 GiB limit = 3.0 GiB
+     * Frontend Max Allocation: 1 replica × 128 MiB limit = 0.128 GiB
+     * Backend Allocation: 1 replica × 2.0 GiB limit = 2.0 GiB
+     * Worst-Case Total Allocation: 2.62 + 3.0 + 0.128 + 2.0 = ~7.75 GiB (fits physical 7.57 GiB RAM with negligible burst into 2.0 GiB swap). If backend scaled to 2 replicas (4.0 GiB), peak limits would reach 9.75 GiB, risking host VM OOM crashes.
+6. **Secrets & Manifest Management:**
+   `k8s/secret.template.yaml`, `k8s/backend-deployment.template.yaml`, and `k8s/ml-service-deployment.template.yaml` are committed as reference templates. Real credentials from `.env` and the dynamic kind gateway IP are templated via `python k8s/generate-secrets.py` on deployment. Generated files containing local secrets (`secret.yaml`) are strictly ignored by git (`.gitignore`).
 
 ---
 
 ### How to Run the Kubernetes Stack
 
-#### 1. Prerequisites
-- Docker Desktop running with WSL2 backend.
-- `kind` CLI installed and `kubectl` in PATH.
+#### 1. Prerequisites & Tool Installation
+- **Docker Desktop** running with WSL2 backend.
+- **kind** (Kubernetes in Docker, v0.27+):
+  * *Windows*: `winget install Kubernetes.kind` or `choco install kind` (or place `kind.exe` in `%USERPROFILE%\.local\bin` or user PATH — do not install into Docker Desktop's program directories).
+  * *macOS*: `brew install kind`
+  * *Linux*: `curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.27.0/kind-linux-amd64 && chmod +x ./kind && sudo mv ./kind /usr/local/bin/kind`
+- **kubectl** (Kubernetes CLI, v1.30+):
+  * *Windows*: `winget install Kubernetes.kubectl` or `choco install kubernetes-cli` (or enabled via Docker Desktop Kubernetes settings).
+  * *macOS*: `brew install kubectl`
+  * *Linux*: `curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" && chmod +x kubectl && sudo mv kubectl /usr/local/bin/`
 
 #### 2. Start Compose Infrastructure & Create Kind Cluster
 ```bash
@@ -563,7 +579,7 @@ kind load docker-image epinet-backend:latest epinet-ml-service:latest epinet-fro
 # Install metrics-server with insecure TLS for kind
 kubectl apply -f k8s/metrics-server.yaml
 
-# Generate secret.yaml from local .env
+# Generate secret.yaml and template deployment manifests with discovered kind gateway IP
 python k8s/generate-secrets.py
 
 # Apply ConfigMap, Secrets, Deployments, Services, and HPAs
@@ -587,11 +603,16 @@ python scratch/verify_k8s_40mb.py
 python scratch/test_k8s_load_hpa.py
 
 # Run mid-job pod deletion resilience test
-python scratch/test_k8s_pod_resilience.py
+python scratch/test_pod_recovery_3trials.py
 
 # Run complete 6-scenario validation suite against Kubernetes
 python tests/e2e/run_e2e_tests.py --k8s
 ```
+
+#### 5. Empirical Pod Resilience Findings (Single-Replica forced deletion)
+Under single-replica execution (HPAs removed, 1 replica pinned):
+- **Backend Pod Kill Mid-Job**: Replacement pod reaches Ready in ~31.8s. In-flight jobs fail with `Connection refused` (2 out of 3 trials) because ML worker retries (~2s total) exhaust before the JVM completes its ~31s cold start.
+- **ML-Service Pod Kill Mid-Job**: Replacement pod reaches Ready in ~2.6s. In-flight jobs remain in `PROCESSING` indefinitely (3 out of 3 trials) because the Kafka message was auto-committed/consumed prior to pod termination, and no active lease/rebalancing mechanism re-enqueues the uncompleted job.
 
 ---
 

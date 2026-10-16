@@ -1,6 +1,6 @@
 # k8s/ml-service-deployment.yaml — Deployment and Service for FastAPI ML Worker (Phase 4)
 # WHY: provides scalable epistasis linear regression worker consuming from Kafka
-# with readiness/liveness probes and NodePort 30082 exposure.
+# with readiness/liveness probes and NodePort 30082 exposure. 172.19.0.1 is templated at deploy time.
 
 apiVersion: apps/v1
 kind: Deployment
@@ -20,7 +20,7 @@ spec:
         app: ml-service
     spec:
       hostAliases:
-      # WHY hostAliases: routes host.docker.internal to kind bridge gateway IP (172.19.0.1)
+      # WHY hostAliases: routes host.docker.internal to kind bridge gateway IP
       # allowing the worker to connect to compose Kafka (port 9094)
       - ip: "172.19.0.1"
         hostnames:
