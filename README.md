@@ -438,12 +438,12 @@ A controlled experiment was conducted across backend container memory limits (1.
 | Stage | Run 1 | Run 2 | Run 3 | Run 4 | Run 5 | Min | Median | Max |
 |---|---|---|---|---|---|---|---|---|
 | `client_upload` | 1.736s | 1.275s | 3.216s | 1.918s | 1.462s | 1.275s | 1.736s | 3.216s |
-| `upload_to_published` | 1.514s | 0.985s | 0.000s | 1.736s | 1.297s | 0.000s | 1.297s | 1.736s |
+| `upload_to_published` | 1.514s | 0.985s | *N/A* | 1.736s | 1.297s | 0.985s | 1.406s | 1.736s |
 | &nbsp;&nbsp;↳ `multipart_recv` | 0.000s | 0.000s | 0.000s | 0.000s | 0.000s | 0.000s | 0.000s | 0.000s |
-| &nbsp;&nbsp;↳ `csv_validate` | 0.087s | 0.142s | 0.000s | 0.034s | 0.040s | 0.000s | 0.040s | 0.142s |
-| &nbsp;&nbsp;↳ `entity_build` | 0.000s | 0.007s | 0.000s | 0.000s | 0.000s | 0.000s | 0.000s | 0.007s |
-| &nbsp;&nbsp;↳ `db_insert` | 1.280s | 0.830s | 0.000s | 1.701s | 1.256s | 0.000s | 1.256s | 1.701s |
-| &nbsp;&nbsp;↳ `kafka_publish` | 0.147s | 0.006s | 0.000s | 0.001s | 0.001s | 0.000s | 0.001s | 0.147s |
+| &nbsp;&nbsp;↳ `csv_validate` | 0.087s | 0.142s | *N/A* | 0.034s | 0.040s | 0.034s | 0.064s | 0.142s |
+| &nbsp;&nbsp;↳ `entity_build` | 0.000s | 0.007s | *N/A* | 0.000s | 0.000s | 0.000s | 0.000s | 0.007s |
+| &nbsp;&nbsp;↳ `db_insert` | 1.280s | 0.830s | *N/A* | 1.701s | 1.256s | 0.830s | 1.268s | 1.701s |
+| &nbsp;&nbsp;↳ `kafka_publish` | 0.147s | 0.006s | *N/A* | 0.001s | 0.001s | 0.001s | 0.004s | 0.147s |
 | `queue_wait` | 0.023s | 0.012s | 0.005s | 0.004s | 0.014s | 0.004s | 0.012s | 0.023s |
 | `csv_fetch` | 0.738s | 15.536s | 29.011s | 11.823s | 0.402s | 0.402s | 11.823s | 29.011s |
 | `compute` | 3.407s | 3.502s | 3.276s | 2.672s | 3.487s | 2.672s | 3.407s | 3.502s |
@@ -451,20 +451,34 @@ A controlled experiment was conducted across backend container memory limits (1.
 | `poll_duration` | 5.117s | 36.280s | 48.676s | 15.339s | 5.031s | 5.031s | 15.339s | 48.676s |
 | **`total_e2e`** | **6.852s** | **37.555s** | **51.893s** | **17.256s** | **6.493s** | **6.493s** | **17.256s** | **51.893s** |
 
+> **Note on Run 3:** Sub-stage timings for `upload_to_published` and its children reported 0.000s, indicating missing instrumentation data for that run. These values are treated as N/A; Min/Median/Max for affected stages are computed from the remaining 4 runs only.
+
+#### Run-Order Drift
+
+Median `total_e2e` increased over the session despite `docker compose down -v` between conditions:
+
+| Condition (chronological) | A1 | B1 | B2 | A2 | Default Redo |
+|---|---|---|---|---|---|
+| Median `total_e2e` | 9.658s | 5.779s | 13.984s | 18.421s | 17.256s |
+
+Conditions A1 and A2 are the same configuration (1.5 GB backend, 256M redo) yet differ by almost 2× in median total time (9.7s vs 18.4s). This run-order drift means the Default Redo condition (run last at median 17.3s) cannot be cleanly compared to earlier conditions; the higher latency may reflect host-level resource exhaustion accumulating across the session rather than the redo log change alone.
+
 #### Findings: What Was and Was Not Established
 
 1. **What WAS Established:**
-   - **MySQL Redo Log Capacity Directly Confirmed**: Under default MySQL 8 configuration (`innodb_redo_log_capacity=100M`), consecutive 40 MB transactions triggered 3 explicit warnings in `docker logs epinet-mysql`:
+   - **MySQL Redo Log Warnings Under Default Capacity**: Under default MySQL 8 configuration (`innodb_redo_log_capacity=100M`), consecutive 40 MB transactions triggered 3 explicit warnings in `docker logs epinet-mysql`:
      * `[MY-014089] [InnoDB] Redo log writer is waiting for a new redo log file. Consider increasing innodb_redo_log_capacity.`
      * `[MY-014084] [InnoDB] Threads are unable to reserve space in redo log which can't be reclaimed due to the 'log_checkpointer' consumer still lagging behind at LSN = 116248542.`
-     In contrast, under `--innodb_redo_log_capacity=256M`, **0 redo log warnings** occurred across all 20 runs across Conditions A1, B1, B2, and A2.
-   - **Heap Pressure & GC Evaluation via Prometheus**:
-     * **Condition A (1.5 GB limit, max heap 1152 MB)**: Peak heap usage reached 1029–1136 MB (median ~1075–1082 MB, 93–94% of max heap). Under peak heap pressure, G1GC pause durations intermittently reached 2.4–2.6s, but completed with zero OOM events (`OOMKilled: false`).
-     * **Condition B (2.0 GB limit, max heap 1536 MB)**: Peak heap usage reached 1136–1506 MB (median ~1239–1460 MB, 81–95% of max heap). GC pause durations were consistently lower (median 0.036–0.051s, max 0.571s).
+     Under `--innodb_redo_log_capacity=256M`, **0 redo log warnings** occurred across all 20 runs (Conditions A1, B1, B2, A2). However, the Default Redo condition was run last and is confounded by run-order drift (see above).
+   - **Heap Usage Measured via Prometheus (`jvm_memory_used_bytes{area="heap"}`):**
+     * **Condition A (1.5 GB limit, max heap 1152 MB)**: Peak heap usage 1029–1136 MB (93–94% of max heap). Cumulative `jvm_gc_pause_seconds_sum` per condition ranged from 0.043s to 2.600s.
+     * **Condition B (2.0 GB limit, max heap 1536 MB)**: Peak heap usage 1136–1506 MB (81–95% of max heap). Cumulative `jvm_gc_pause_seconds_sum` per condition ranged from 0.036s to 0.571s.
+     * Note: GC totals above are per-condition cumulative sums, not per-request values.
 
 2. **What WAS NOT Established:**
-   - **Memory size is not the primary cause of tail upload stalls**: A pure JVM heap-exhaustion explanation for multi-second upload stalls is not supported by the controlled data. In Condition B2 (2.0 GB limit), Run 2 exhibited a 22.1s client upload (`db_insert=21.959s`) despite 2 GB memory headroom, 0 redo-log warnings, and only 0.051s GC pause duration.
-   - **Tail latency cause**: Intermittent 10–25s database write and status update stalls occur across both 1.5 GB and 2.0 GB conditions, likely attributable to host-level filesystem flush / fsync stalls under Docker Desktop/WSL2 storage virtualization; root cause remains unconfirmed.
+   - **1.5 GB vs 2.0 GB backend limit showed no consistent difference**: A1 (1.5g, median 9.7s) and A2 (1.5g, median 18.4s) differ as much as A vs B, so the memory limit change cannot be separated from run-order effects in this experiment.
+   - **Tail latency cause**: Intermittent 10–25s `db_insert` and `result_write_back` stalls occur across both 1.5 GB and 2.0 GB conditions. Root cause is not confirmed.
+   - **Nginx reverse proxy**: 40 MB uploads work with `proxy_request_buffering off` in the frontend Nginx config. The earlier container healthcheck failure was caused by `wget http://localhost:8080` resolving to IPv6 `::1` while Nginx only listened on IPv4; fixed by adding `listen [::]:8080;` and changing the healthcheck to use `127.0.0.1`.
 
 ---
 
