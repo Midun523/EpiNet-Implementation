@@ -1,0 +1,48 @@
+# k8s/hpa.yaml — Horizontal Pod Autoscalers for backend and ml-service (Phase 4)
+# WHY: automatically scales replicas based on CPU utilization during heavy computational loads or uploads.
+
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: backend-hpa
+  labels:
+    app.kubernetes.io/name: backend
+    app.kubernetes.io/part-of: epinet
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: backend
+  minReplicas: 1
+  maxReplicas: 4
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        # WHY 60%: triggers scale-out when CPU usage exceeds 60% of request (150m) during concurrent uploads
+        averageUtilization: 60
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: ml-service-hpa
+  labels:
+    app.kubernetes.io/name: ml-service
+    app.kubernetes.io/part-of: epinet
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: ml-service
+  minReplicas: 1
+  maxReplicas: 4
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        # WHY 60%: triggers scale-out when CPU usage exceeds 60% of request (150m) during multi-pair epistasis regression
+        averageUtilization: 60

@@ -1,0 +1,20 @@
+# k8s/configmap.yaml — Shared environment configuration for EpiNet services (Phase 4)
+# WHY: decouples static service URLs and networking configuration from container images and Pod manifests.
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: epinet-config
+  labels:
+    app.kubernetes.io/part-of: epinet
+data:
+  # WHY host.docker.internal:3307: connects to the compose MySQL instance from inside kind pods
+  DB_URL: "jdbc:mysql://host.docker.internal:3307/epinet?createDatabaseIfNotExist=true&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC&useServerPrepStmts=true"
+  DB_USER: "epinet"
+  # WHY host.docker.internal:9094: connects to the compose Kafka broker via the dedicated K8S listener
+  KAFKA_BOOTSTRAP_SERVERS: "host.docker.internal:9094"
+  # WHY http://ml-service:8000: routes asynchronous analysis requests to the Kubernetes ML service ClusterIP
+  ML_SERVICE_URL: "http://ml-service:8000"
+  # WHY http://backend:8080: routes data fetching and result callbacks to the Kubernetes Backend ClusterIP
+  BACKEND_URL: "http://backend:8080"
+  ANALYSIS_MODE: "kafka"

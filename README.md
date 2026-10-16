@@ -482,6 +482,119 @@ Conditions A1 and A2 are the same configuration (1.5 GB backend, 256M redo) yet 
 
 ---
 
+## Phase 4: Local Kubernetes Orchestration (kind)
+
+### Architecture & Design Decisions
+
+```
++─────────────────────────────────────────────────────────────────────────────+
+| Windows / Docker Desktop Host (7.57 GiB VM Memory, ~5.6 GiB Available)     |
+|                                                                             |
+|  +──────────────────────────────────+   +────────────────────────────────+  |
+|  | Docker Compose Stack (Stateful)  |   | kind Cluster: epinet-cluster   |  |
+|  |                                  |   | (v1.32.2 Control-Plane Node)   |  |
+|  |  • MySQL 8.0.46                  |   |                                |  |
+|  |    Port 3307                     |   |  • frontend (NodePort 30080)   |  |
+|  |    Buffer pool: 512M             |   |    Nginx reverse proxy         |  |
+|  |    Redo log: 256M                |   |    requests 50m / 32Mi         |  |
+|  |    Named volume                  |   |                                |  |
+|  |                                  |   |  • backend (NodePort 30081)    |  |
+|  |  • Kafka 3.8.0 (KRaft)           |   |    Spring Boot 3.4 JRE         |  |
+|  |    Port 9092: PLAINTEXT (host)   |   |    requests 250m / 1Gi         |  |
+|  |    Port 29092: INTERNAL (compose)|   |    limits 1500m / 2Gi          |  |
+|  |    Port 9094: K8S (pods)         |   |    HPA: 1-4 replicas (60% cpu) |  |
+|  +─────────────────▲────────────────+   |                                |  |
+|                    │                    |  • ml-service (NodePort 30082) |  |
+|                    │ hostAliases        |    FastAPI Python 3.12 worker  |  |
+|                    │ host.docker.internal|    requests 250m / 350Mi       |  |
+|                    │ -> 172.19.0.1      |    limits 1500m / 1Gi          |  |
+|                    └────────────────────┼─── HPA: 1-4 replicas (60% cpu) |  |
+|                                         +────────────────────────────────+  |
++─────────────────────────────────────────────────────────────────────────────+
+```
+
+1. **Why `kind` instead of Docker Desktop Kubernetes:**
+   Docker Desktop built-in Kubernetes was not enabled on the host (`kubectl config get-contexts` returned empty). `kind` (Kubernetes in Docker) v0.27.0 with node image `kindest/node:v1.32.2` was chosen because it allows declarative, reproducible cluster configuration committed directly to the repository (`k8s/kind-config.yaml`).
+2. **Stateful Infrastructure Split:**
+   MySQL and Kafka remain managed in Docker Compose. Running stateless application pods in Kubernetes while keeping relational and messaging brokers in Compose minimizes cluster memory footprint (kind node uses ~695 MiB, MySQL ~780 MiB, Kafka ~330 MiB, leaving > 5.5 GiB free headroom in the Docker VM). Unneeded observability services (`prometheus`, `grafana`, `kafka-exporter`) are stopped during cluster runs.
+3. **Cross-Boundary Networking & Kafka Triple Listeners:**
+   - **Bridge Gateway Routing**: Kind pods communicate with Compose services via `host.docker.internal`, mapped to the kind bridge network gateway IPv4 (`172.19.0.1`) via pod `hostAliases`.
+   - **Kafka Listener Architecture**:
+     * `PLAINTEXT://localhost:9092`: Host scripts and e2e test runners.
+     * `INTERNAL://kafka:29092`: Compose inter-service traffic.
+     * `K8S://host.docker.internal:9094`: Kubernetes cluster pods connecting via the bridge gateway.
+4. **Empirically Measured Resource Requests & Limits:**
+   - `backend`: Requests `cpu: 250m, memory: 1Gi`; Limits `cpu: 1500m, memory: 2Gi`. JVM configured with `-XX:MaxRAMPercentage=70.0 -XX:+UseG1GC` (~1430 MB heap). Under consecutive 40 MB uploads, container RSS reaches ~1.55 GiB due to Metaspace, Tomcat multipart buffers, thread stacks, and G1GC native memory; a 2Gi limit prevents kernel `OOMKilled` (exit code 137).
+   - `ml-service`: Requests `cpu: 250m, memory: 350Mi`; Limits `cpu: 1500m, memory: 1Gi`.
+   - `frontend`: Requests `cpu: 50m, memory: 32Mi`; Limits `cpu: 250m, memory: 128Mi`.
+5. **Horizontal Pod Autoscaling (HPA):**
+   Metrics-server deployed with `--kubelet-insecure-tls` to scrape kindlet nodes. HPAs target 60% CPU utilization for backend and ml-service (1 to 4 replicas).
+6. **Secrets Management:**
+   `k8s/secret.template.yaml` is committed as a reference template. Real credentials are generated locally from `.env` via `python k8s/generate-secrets.py` into `k8s/secret.yaml`, which is strictly ignored by git (`.gitignore`).
+
+---
+
+### How to Run the Kubernetes Stack
+
+#### 1. Prerequisites
+- Docker Desktop running with WSL2 backend.
+- `kind` CLI installed and `kubectl` in PATH.
+
+#### 2. Start Compose Infrastructure & Create Kind Cluster
+```bash
+# Start MySQL and Kafka in compose
+docker compose up -d mysql kafka
+
+# Stop unneeded services to conserve memory
+docker compose stop backend ml-service frontend prometheus grafana kafka-exporter
+
+# Create kind cluster from repository config
+kind create cluster --config k8s/kind-config.yaml
+
+# Pre-load local Docker images into kind node
+docker build -t epinet-backend:latest ./backend
+docker build -t epinet-ml-service:latest ./ml-service
+docker build -t epinet-frontend:latest ./frontend
+kind load docker-image epinet-backend:latest epinet-ml-service:latest epinet-frontend:latest --name epinet-cluster
+```
+
+#### 3. Deploy Metrics-Server & Application Manifests
+```bash
+# Install metrics-server with insecure TLS for kind
+kubectl apply -f k8s/metrics-server.yaml
+
+# Generate secret.yaml from local .env
+python k8s/generate-secrets.py
+
+# Apply ConfigMap, Secrets, Deployments, Services, and HPAs
+kubectl apply -f k8s/configmap.yaml \
+              -f k8s/secret.yaml \
+              -f k8s/backend-deployment.yaml \
+              -f k8s/ml-service-deployment.yaml \
+              -f k8s/frontend-deployment.yaml \
+              -f k8s/hpa.yaml
+
+# Verify all pods are Ready
+kubectl get pods -o wide
+```
+
+#### 4. Run End-to-End & Resilience Tests
+```bash
+# Verify 40 MB upload through cluster NodePort 30080
+python scratch/verify_k8s_40mb.py
+
+# Run HPA scale-out load test
+python scratch/test_k8s_load_hpa.py
+
+# Run mid-job pod deletion resilience test
+python scratch/test_k8s_pod_resilience.py
+
+# Run complete 6-scenario validation suite against Kubernetes
+python tests/e2e/run_e2e_tests.py --k8s
+```
+
+---
+
 ## Data Retention & Lifecycle
 
 - **Uploaded CSV Deletion on Terminal States**: Raw uploaded CSV data (`csv_data` LONGBLOB) is stored temporarily in MySQL solely to allow the asynchronous ML worker to fetch the input dataset. Once an analysis transitions to a terminal state (`COMPLETED` or `FAILED`), the targeted repository updates (`markCompleted` and `markFailed`) set `csv_data = NULL`. This immediately reclaims tablespace, bounds storage consumption, and avoids persisting sensitive patient genomic data beyond the processing lifecycle. Computed interaction matrices and summary statistics remain permanently available in `result_json`.

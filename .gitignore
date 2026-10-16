@@ -38,3 +38,8 @@ Thumbs.db
 .tools/
 scratch/
 *.log
+
+# ─── Kubernetes Secrets ─────────────────────────────
+# WHY: secret.yaml contains sensitive production/environment database credentials generated from .env
+k8s/secret.yaml
+*.secret.yaml

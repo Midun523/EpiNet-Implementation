@@ -38,17 +38,20 @@ services:
     restart: unless-stopped
     ports:
       - "9092:9092"   # external listener for host-side tooling and e2e test scripts
+      # WHY port 9094: listener for Kubernetes pods connecting via host.docker.internal / kind gateway
+      - "9094:9094"
     environment:
       # ── KRaft Node Config ──────────────────────────────────────────
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
-      # ── Dual Listeners ─────────────────────────────────────────────
-      # WHY dual listeners: PLAINTEXT (9092) advertises localhost for host scripts,
-      # while INTERNAL (29092) advertises kafka:29092 for inter-container communication
-      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,INTERNAL://0.0.0.0:29092,CONTROLLER://0.0.0.0:9093
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,INTERNAL://kafka:29092
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,INTERNAL:PLAINTEXT
+      # ── Triple Listeners ───────────────────────────────────────────
+      # WHY triple listeners: PLAINTEXT (9092) advertises localhost for host scripts,
+      # INTERNAL (29092) advertises kafka:29092 for compose inter-container communication,
+      # and K8S (9094) advertises host.docker.internal:9094 for Kubernetes cluster pods
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,INTERNAL://0.0.0.0:29092,CONTROLLER://0.0.0.0:9093,K8S://0.0.0.0:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,INTERNAL://kafka:29092,K8S://host.docker.internal:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,INTERNAL:PLAINTEXT,K8S:PLAINTEXT
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       # ── Topic Partitions & Replication ─────────────────────────────
