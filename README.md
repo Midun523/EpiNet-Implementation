@@ -349,41 +349,122 @@ A 5-run benchmark of ~40 MB CSV uploads was conducted against the live, fully in
 
 > **Tail Latency & Resilience Note:** up to 45 s observed on one run; likely storage flush stalls under Docker Desktop/WSL2; cause not confirmed. During Run 3, the ML worker's initial HTTP GET timed out at 30s (`N/A` for subsequent stages). To prevent permanent job failures from transient stalls, the ML worker implements automatic data fetch retries (3 attempts, backoff 2/5/10 s, 60 s timeout per attempt).
 
-### Container-Mode 40 MB Benchmark (Docker Compose)
+### Container-Mode 40 MB Controlled Benchmark (Docker Compose)
 
-A 5-run benchmark was conducted against the fully containerized Compose stack running under cgroup memory limits (`backend: 1.5g`, `ml-service: 1g`).
+A controlled experiment was conducted across backend container memory limits (1.5 GB vs 2.0 GB) and MySQL redo log capacity to isolate memory limits from run-order effects and storage stalls.
 
-- **Date:** 2026-10-15
+- **Date:** 2026-10-16
 - **Machine Type:** Laptop (x86_64, Windows 11, Docker Desktop with WSL2 backend)
-- **Sample Size:** 5 consecutive runs
+- **Experimental Design:** ABBA run order with 5 runs of 40 MB per condition:
+  - **A1:** Backend 1.5 GB (`-XX:MaxRAMPercentage=75.0`), MySQL fixed (`innodb_buffer_pool_size=512M`, `innodb_redo_log_capacity=256M`)
+  - **B1:** Backend 2.0 GB (`-XX:MaxRAMPercentage=75.0`), MySQL fixed (`innodb_buffer_pool_size=512M`, `innodb_redo_log_capacity=256M`)
+  - **B2:** Backend 2.0 GB (`-XX:MaxRAMPercentage=75.0`), MySQL fixed (`innodb_buffer_pool_size=512M`, `innodb_redo_log_capacity=256M`)
+  - **A2:** Backend 1.5 GB (`-XX:MaxRAMPercentage=75.0`), MySQL fixed (`innodb_buffer_pool_size=512M`, `innodb_redo_log_capacity=256M`)
+  - **Default Redo:** Backend 1.5 GB, MySQL on default 100 MB redo log (`innodb_buffer_pool_size=512M`, no custom redo log capacity flag)
+- **Controlled Container State:** Before every condition, containers and named volumes were torn down (`docker compose down -v`) and recreated (`docker compose up -d`) so every condition began from an identical clean state without data accumulation or live `SET GLOBAL` mutations.
 - **Dataset:** ~40.00 MB CSV (377,864 rows, synthetic data repeating sample pharmacogenomics rows)
-- **Container Limits & Sizing:** `backend: 1.5g` (`-XX:MaxRAMPercentage=75.0`), `ml-service: 1g`, MySQL 8.0.46 (`innodb_buffer_pool_size=512M`, `innodb_redo_log_capacity=256M`).
 
-#### Stage Timing Breakdown (Extracted from Real Container Logs)
+#### Stage Timing Breakdowns (Extracted from Real Container Logs)
 
+##### Condition A1 (Backend 1.5g, Tuned Redo 256M)
 | Stage | Run 1 | Run 2 | Run 3 | Run 4 | Run 5 | Min | Median | Max |
 |---|---|---|---|---|---|---|---|---|
-| `client_upload` | 2.045s | 3.700s | 26.725s | 1.614s | 1.616s | 1.614s | 2.045s | 26.725s |
-| `upload_to_published` | 1.618s | 3.217s | 24.338s | 1.318s | 1.251s | 1.251s | 1.618s | 24.338s |
+| `client_upload` | 1.779s | 37.101s | 0.982s | 3.688s | 20.228s | 0.982s | 3.688s | 37.101s |
+| `upload_to_published` | 1.492s | 14.264s | 0.842s | 3.484s | 19.000s | 0.842s | 3.484s | 19.000s |
 | &nbsp;&nbsp;↳ `multipart_recv` | 0.000s | 0.000s | 0.000s | 0.000s | 0.000s | 0.000s | 0.000s | 0.000s |
-| &nbsp;&nbsp;↳ `csv_validate` | 0.070s | 0.169s | 0.126s | 0.045s | 0.075s | 0.045s | 0.075s | 0.169s |
-| &nbsp;&nbsp;↳ `entity_build` | 0.001s | 0.003s | 0.044s | 0.000s | 0.001s | 0.000s | 0.001s | 0.044s |
-| &nbsp;&nbsp;↳ `db_insert` | 1.423s | 3.030s | 24.167s | 1.272s | 1.174s | 1.174s | 1.423s | 24.167s |
-| &nbsp;&nbsp;↳ `kafka_publish` | 0.124s | 0.015s | 0.001s | 0.001s | 0.001s | 0.001s | 0.001s | 0.124s |
-| `queue_wait` | 0.047s | 0.011s | 0.016s | 0.013s | 0.007s | 0.007s | 0.013s | 0.047s |
-| `csv_fetch` | 2.144s | 1.214s | 1.123s | 1.628s | 1.699s | 1.123s | 1.628s | 2.144s |
-| `compute` | 4.400s | 4.594s | 4.246s | 5.037s | 4.877s | 4.246s | 4.594s | 5.037s |
-| `result_write_back` | 0.010s | 0.004s | 0.007s | 0.003s | 0.010s | 0.003s | 0.007s | 0.010s |
-| `poll_duration` | 9.146s | 7.354s | 7.801s | 8.704s | 8.120s | 7.354s | 8.120s | 9.146s |
-| **`total_e2e`** | **11.191s** | **11.054s** | **34.525s** | **10.318s** | **9.736s** | **9.736s** | **11.054s** | **34.525s** |
+| &nbsp;&nbsp;↳ `csv_validate` | 0.064s | 1.308s | 0.030s | 0.035s | 0.038s | 0.030s | 0.038s | 1.308s |
+| &nbsp;&nbsp;↳ `entity_build` | 0.000s | 0.837s | 0.001s | 0.000s | 0.000s | 0.000s | 0.000s | 0.837s |
+| &nbsp;&nbsp;↳ `db_insert` | 1.237s | 12.106s | 0.810s | 3.449s | 18.962s | 0.810s | 3.449s | 18.962s |
+| &nbsp;&nbsp;↳ `kafka_publish` | 0.191s | 0.013s | 0.001s | 0.000s | 0.000s | 0.000s | 0.001s | 0.191s |
+| `queue_wait` | 0.022s | 0.006s | 0.005s | 0.003s | 0.034s | 0.003s | 0.006s | 0.034s |
+| `csv_fetch` | 0.531s | 9.270s | 0.625s | 1.880s | 15.494s | 0.531s | 1.880s | 15.494s |
+| `compute` | 3.395s | 3.202s | 3.159s | 3.161s | 3.714s | 3.159s | 3.202s | 3.714s |
+| `result_write_back` | 0.247s | 0.226s | 0.616s | 0.213s | 9.222s | 0.213s | 0.247s | 9.222s |
+| `poll_duration` | 5.025s | 13.346s | 4.954s | 5.970s | 28.976s | 4.954s | 5.970s | 28.976s |
+| **`total_e2e`** | **6.804s** | **50.446s** | **5.936s** | **9.658s** | **49.204s** | **5.936s** | **9.658s** | **50.446s** |
 
-#### Container Resource & Memory Findings
-- **Backend Memory Sweet Spot**: Comparing 1g, 1.5g, and 2g backend limits, 1.5g achieved the best performance (median `total_e2e` **11.054s** vs 61.898s at 1g). Under 1g, JVM heap is constrained to ~750 MB, causing frequent G1 humongous allocations and GC pauses. At 1.5g, JVM heap expands to ~1.15 GB, reducing GC pause duration to 0.034s–0.158s per job with zero OOM terminations (`OOMKilled: false`).
-- **Peak Container Memory (1.5g limit)**:
-  - `epinet-backend`: 1.50 GiB peak (99.98% of 1.5 GiB cgroup limit, 0 OOM kills)
-  - `epinet-ml-service`: 304.1 MiB peak (29.70% of 1 GiB limit, 0 OOM kills)
-  - `epinet-mysql`: 1.06 GiB peak
-- **Redo Log Capacity**: Setting MySQL `--innodb_redo_log_capacity=256M` (up from default 100 MB) prevents InnoDB checkpoint exhaustion stalls during back-to-back 40 MB transactions.
+##### Condition B1 (Backend 2.0g, Tuned Redo 256M)
+| Stage | Run 1 | Run 2 | Run 3 | Run 4 | Run 5 | Min | Median | Max |
+|---|---|---|---|---|---|---|---|---|
+| `client_upload` | 1.491s | 0.882s | 1.048s | 1.051s | 0.887s | 0.882s | 1.048s | 1.491s |
+| `upload_to_published` | 1.289s | 0.726s | 0.746s | 0.920s | 0.752s | 0.726s | 0.752s | 1.289s |
+| &nbsp;&nbsp;↳ `multipart_recv` | 0.000s | 0.000s | 0.000s | 0.000s | 0.000s | 0.000s | 0.000s | 0.000s |
+| &nbsp;&nbsp;↳ `csv_validate` | 0.041s | 0.041s | 0.048s | 0.024s | 0.035s | 0.024s | 0.041s | 0.048s |
+| &nbsp;&nbsp;↳ `entity_build` | 0.000s | 0.000s | 0.000s | 0.000s | 0.000s | 0.000s | 0.000s | 0.000s |
+| &nbsp;&nbsp;↳ `db_insert` | 1.063s | 0.684s | 0.697s | 0.896s | 0.716s | 0.684s | 0.716s | 1.063s |
+| &nbsp;&nbsp;↳ `kafka_publish` | 0.185s | 0.001s | 0.001s | 0.000s | 0.001s | 0.000s | 0.001s | 0.185s |
+| `queue_wait` | 0.020s | 0.005s | 0.007s | 0.003s | 0.004s | 0.003s | 0.005s | 0.020s |
+| `csv_fetch` | 0.707s | 0.535s | 0.524s | 0.550s | 1.025s | 0.524s | 0.550s | 1.025s |
+| `compute` | 4.448s | 3.052s | 3.208s | 3.012s | 3.059s | 3.012s | 3.059s | 4.448s |
+| `result_write_back` | 0.215s | 0.260s | 0.230s | 0.230s | 0.495s | 0.215s | 0.230s | 0.495s |
+| `poll_duration` | 5.989s | 4.596s | 4.528s | 4.728s | 5.604s | 4.528s | 4.728s | 5.989s |
+| **`total_e2e`** | **7.481s** | **5.478s** | **5.576s** | **5.779s** | **6.491s** | **5.478s** | **5.779s** | **7.481s** |
+
+##### Condition B2 (Backend 2.0g, Tuned Redo 256M)
+| Stage | Run 1 | Run 2 | Run 3 | Run 4 | Run 5 | Min | Median | Max |
+|---|---|---|---|---|---|---|---|---|
+| `client_upload` | 1.679s | 22.141s | 1.379s | 1.246s | 6.801s | 1.246s | 1.679s | 22.141s |
+| `upload_to_published` | 1.423s | 21.994s | 1.234s | 1.080s | 6.547s | 1.080s | 1.423s | 21.994s |
+| &nbsp;&nbsp;↳ `multipart_recv` | 0.000s | 0.000s | 0.000s | 0.000s | 0.000s | 0.000s | 0.000s | 0.000s |
+| &nbsp;&nbsp;↳ `csv_validate` | 0.054s | 0.034s | 0.041s | 0.015s | 0.033s | 0.015s | 0.034s | 0.054s |
+| &nbsp;&nbsp;↳ `entity_build` | 0.001s | 0.000s | 0.000s | 0.000s | 0.000s | 0.000s | 0.000s | 0.001s |
+| &nbsp;&nbsp;↳ `db_insert` | 1.211s | 21.959s | 1.193s | 1.065s | 6.513s | 1.065s | 1.211s | 21.959s |
+| &nbsp;&nbsp;↳ `kafka_publish` | 0.157s | 0.001s | 0.000s | 0.000s | 0.001s | 0.000s | 0.001s | 0.157s |
+| `queue_wait` | 0.026s | 0.007s | 0.004s | 0.003s | 0.066s | 0.003s | 0.007s | 0.066s |
+| `csv_fetch` | 0.652s | 9.360s | 8.061s | 2.442s | 13.990s | 0.652s | 8.061s | 13.990s |
+| `compute` | 3.468s | 2.930s | 3.397s | 2.818s | 3.957s | 2.818s | 3.397s | 3.957s |
+| `result_write_back` | 1.307s | 0.245s | 0.233s | 0.393s | 15.056s | 0.233s | 0.393s | 15.056s |
+| `poll_duration` | 5.965s | 13.235s | 12.605s | 6.072s | 36.825s | 5.965s | 12.605s | 36.825s |
+| **`total_e2e`** | **7.644s** | **35.377s** | **13.984s** | **7.318s** | **43.626s** | **7.318s** | **13.984s** | **43.626s** |
+
+##### Condition A2 (Backend 1.5g, Tuned Redo 256M)
+| Stage | Run 1 | Run 2 | Run 3 | Run 4 | Run 5 | Min | Median | Max |
+|---|---|---|---|---|---|---|---|---|
+| `client_upload` | 1.791s | 1.404s | 0.968s | 0.875s | 2.908s | 0.875s | 1.404s | 2.908s |
+| `upload_to_published` | 1.398s | 1.155s | 0.814s | 0.699s | 2.660s | 0.699s | 1.155s | 2.660s |
+| &nbsp;&nbsp;↳ `multipart_recv` | 0.000s | 0.000s | 0.000s | 0.000s | 0.000s | 0.000s | 0.000s | 0.000s |
+| &nbsp;&nbsp;↳ `csv_validate` | 0.044s | 0.046s | 0.026s | 0.053s | 0.039s | 0.026s | 0.044s | 0.053s |
+| &nbsp;&nbsp;↳ `entity_build` | 0.000s | 0.000s | 0.001s | 0.001s | 0.001s | 0.000s | 0.001s | 0.001s |
+| &nbsp;&nbsp;↳ `db_insert` | 1.203s | 1.107s | 0.786s | 0.644s | 2.619s | 0.644s | 1.107s | 2.619s |
+| &nbsp;&nbsp;↳ `kafka_publish` | 0.151s | 0.002s | 0.001s | 0.001s | 0.001s | 0.001s | 0.001s | 0.151s |
+| `queue_wait` | 0.022s | 0.007s | 0.005s | 0.006s | 0.008s | 0.005s | 0.007s | 0.022s |
+| `csv_fetch` | 0.839s | 3.440s | 29.562s | 5.650s | 9.857s | 0.839s | 5.650s | 29.562s |
+| `compute` | 3.084s | 3.300s | 3.025s | 3.034s | 3.105s | 3.025s | 3.084s | 3.300s |
+| `result_write_back` | 0.275s | 0.349s | 0.268s | 7.613s | 18.509s | 0.268s | 0.349s | 18.509s |
+| `poll_duration` | 5.409s | 7.689s | 33.537s | 17.546s | 32.418s | 5.409s | 17.546s | 33.537s |
+| **`total_e2e`** | **7.199s** | **9.092s** | **34.505s** | **18.421s** | **35.326s** | **7.199s** | **18.421s** | **35.326s** |
+
+##### Condition Default Redo (Backend 1.5g, Default Redo Log 100M)
+| Stage | Run 1 | Run 2 | Run 3 | Run 4 | Run 5 | Min | Median | Max |
+|---|---|---|---|---|---|---|---|---|
+| `client_upload` | 1.736s | 1.275s | 3.216s | 1.918s | 1.462s | 1.275s | 1.736s | 3.216s |
+| `upload_to_published` | 1.514s | 0.985s | 0.000s | 1.736s | 1.297s | 0.000s | 1.297s | 1.736s |
+| &nbsp;&nbsp;↳ `multipart_recv` | 0.000s | 0.000s | 0.000s | 0.000s | 0.000s | 0.000s | 0.000s | 0.000s |
+| &nbsp;&nbsp;↳ `csv_validate` | 0.087s | 0.142s | 0.000s | 0.034s | 0.040s | 0.000s | 0.040s | 0.142s |
+| &nbsp;&nbsp;↳ `entity_build` | 0.000s | 0.007s | 0.000s | 0.000s | 0.000s | 0.000s | 0.000s | 0.007s |
+| &nbsp;&nbsp;↳ `db_insert` | 1.280s | 0.830s | 0.000s | 1.701s | 1.256s | 0.000s | 1.256s | 1.701s |
+| &nbsp;&nbsp;↳ `kafka_publish` | 0.147s | 0.006s | 0.000s | 0.001s | 0.001s | 0.000s | 0.001s | 0.147s |
+| `queue_wait` | 0.023s | 0.012s | 0.005s | 0.004s | 0.014s | 0.004s | 0.012s | 0.023s |
+| `csv_fetch` | 0.738s | 15.536s | 29.011s | 11.823s | 0.402s | 0.402s | 11.823s | 29.011s |
+| `compute` | 3.407s | 3.502s | 3.276s | 2.672s | 3.487s | 2.672s | 3.407s | 3.502s |
+| `result_write_back` | 0.233s | 0.979s | 8.055s | 0.184s | 0.164s | 0.164s | 0.233s | 8.055s |
+| `poll_duration` | 5.117s | 36.280s | 48.676s | 15.339s | 5.031s | 5.031s | 15.339s | 48.676s |
+| **`total_e2e`** | **6.852s** | **37.555s** | **51.893s** | **17.256s** | **6.493s** | **6.493s** | **17.256s** | **51.893s** |
+
+#### Findings: What Was and Was Not Established
+
+1. **What WAS Established:**
+   - **MySQL Redo Log Capacity Directly Confirmed**: Under default MySQL 8 configuration (`innodb_redo_log_capacity=100M`), consecutive 40 MB transactions triggered 3 explicit warnings in `docker logs epinet-mysql`:
+     * `[MY-014089] [InnoDB] Redo log writer is waiting for a new redo log file. Consider increasing innodb_redo_log_capacity.`
+     * `[MY-014084] [InnoDB] Threads are unable to reserve space in redo log which can't be reclaimed due to the 'log_checkpointer' consumer still lagging behind at LSN = 116248542.`
+     In contrast, under `--innodb_redo_log_capacity=256M`, **0 redo log warnings** occurred across all 20 runs across Conditions A1, B1, B2, and A2.
+   - **Heap Pressure & GC Evaluation via Prometheus**:
+     * **Condition A (1.5 GB limit, max heap 1152 MB)**: Peak heap usage reached 1029–1136 MB (median ~1075–1082 MB, 93–94% of max heap). Under peak heap pressure, G1GC pause durations intermittently reached 2.4–2.6s, but completed with zero OOM events (`OOMKilled: false`).
+     * **Condition B (2.0 GB limit, max heap 1536 MB)**: Peak heap usage reached 1136–1506 MB (median ~1239–1460 MB, 81–95% of max heap). GC pause durations were consistently lower (median 0.036–0.051s, max 0.571s).
+
+2. **What WAS NOT Established:**
+   - **Memory size is not the primary cause of tail upload stalls**: A pure JVM heap-exhaustion explanation for multi-second upload stalls is not supported by the controlled data. In Condition B2 (2.0 GB limit), Run 2 exhibited a 22.1s client upload (`db_insert=21.959s`) despite 2 GB memory headroom, 0 redo-log warnings, and only 0.051s GC pause duration.
+   - **Tail latency cause**: Intermittent 10–25s database write and status update stalls occur across both 1.5 GB and 2.0 GB conditions, likely attributable to host-level filesystem flush / fsync stalls under Docker Desktop/WSL2 storage virtualization; root cause remains unconfirmed.
 
 ---
 
