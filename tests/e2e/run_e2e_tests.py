@@ -131,6 +131,20 @@ def start_ml_service():
     proc = subprocess.Popen(cmd, cwd=ML_SERVICE_DIR, env=env, stdout=log_file, stderr=subprocess.STDOUT)
     return proc, log_file
 
+def kill_proc(proc, log_file=None):
+    if proc:
+        try:
+            # On Windows, taskkill /F /T kills child processes (e.g. uvicorn workers, java)
+            subprocess.run(f"taskkill /F /T /PID {proc.pid}", shell=True, capture_output=True)
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+    if log_file:
+        try:
+            log_file.close()
+        except Exception:
+            pass
+
 def stop_ml_worker(proc=None, log_file=None):
     if K8S_MODE:
         print("  [K8S MODE] Scaling ml-service to 0 replicas...")
@@ -275,8 +289,10 @@ try:
     success, transitions, final_st = poll_for_status(analysis_id, "COMPLETED", 60)
     print(f"  Final Status: {final_st.get('status')} | Seen transitions: {' -> '.join(transitions)}")
     assert success, f"Job did not complete. Seen: {transitions}"
-    # WHY: 1 KB test CSV computes in <15ms; if the first poll arrives after completion, transitions will be ['COMPLETED']
-    assert "PROCESSING" in transitions or final_st.get("status") == "COMPLETED", f"Expected PROCESSING or COMPLETED in transitions, saw: {transitions}"
+    # WHY: 1 KB test CSV computes in <20ms; if the first poll arrives after completion, transitions will be ['COMPLETED'].
+    # The strict PENDING -> PROCESSING -> COMPLETED transition is enforced on the 10 MB job in Test 5.
+    if "PROCESSING" not in transitions:
+        print(f"  Note: 1 KB tiny job completed before first poll captured PROCESSING (transitions: {transitions})")
 
     result_data = get_result(analysis_id)
     genes_count = len(result_data.get("genes", []))
@@ -452,6 +468,8 @@ try:
     proc_10mb_sec = round(time.time() - t_proc_10, 3)
     print(f"  10 MB job completed in {proc_10mb_sec}s! Status: {final_st_10.get('status')}")
     assert success_10, f"10 MB job did not complete: {transitions_10}"
+    # Strict lifecycle assertion: 10 MB payload duration (>1s) guarantees polling captures PROCESSING
+    assert "PROCESSING" in transitions_10, f"Expected PROCESSING in transitions for 10 MB job, saw: {transitions_10}"
 
     # 2. Test ~40 MB Upload - Run 3 times to measure min / median / max
     print("\n  Benchmarking ~40 MB CSV (running 3 iterations to measure min/median/max analysis time)...")

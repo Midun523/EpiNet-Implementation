@@ -44,13 +44,13 @@ spec:
               name: epinet-config
               key: KAFKA_BOOTSTRAP_SERVERS
         resources:
-          # WHY requests/limits: measured empirically during Phase 3 40 MB regression benchmark
+          # WHY requests/limits: measured peak RSS is ~119-146 MiB under 40 MB jobs; 512Mi limit provides >2.8x headroom
           requests:
             cpu: "250m"
-            memory: "350Mi"
+            memory: "256Mi"
           limits:
             cpu: "1500m"
-            memory: "1Gi"
+            memory: "512Mi"
         readinessProbe:
           httpGet:
             path: /health

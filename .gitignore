@@ -39,7 +39,9 @@ Thumbs.db
 scratch/
 *.log
 
-# ─── Kubernetes Secrets ─────────────────────────────
-# WHY: secret.yaml contains sensitive production/environment database credentials generated from .env
+# ─── Kubernetes Generated Manifests ─────────────────────────────
+# WHY: secret.yaml contains sensitive credentials; deployment manifests are templated with dynamic host gateway
 k8s/secret.yaml
 *.secret.yaml
+k8s/backend-deployment.yaml
+k8s/ml-service-deployment.yaml

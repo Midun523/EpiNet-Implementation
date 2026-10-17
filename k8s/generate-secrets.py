@@ -20,8 +20,6 @@ BACKEND_OUTPUT = REPO_ROOT / "k8s" / "backend-deployment.yaml"
 ML_TEMPLATE = REPO_ROOT / "k8s" / "ml-service-deployment.template.yaml"
 ML_OUTPUT = REPO_ROOT / "k8s" / "ml-service-deployment.yaml"
 
-DEFAULT_GATEWAY = "172.19.0.1"
-
 def parse_env(path: Path) -> dict[str, str]:
     env = {}
     if not path.exists():
@@ -36,7 +34,8 @@ def parse_env(path: Path) -> dict[str, str]:
     return env
 
 def discover_kind_gateway() -> str:
-    # WHY: reads kind bridge network gateway from Docker daemon at deploy time
+    # WHY: reads kind bridge network gateway from Docker daemon at deploy time.
+    # Must fail immediately with a hard error if kind network or gateway is missing (no silent fallback).
     try:
         res = subprocess.run(
             ["docker", "network", "inspect", "kind"],
@@ -50,8 +49,8 @@ def discover_kind_gateway() -> str:
                 if "." in gw: # Look for IPv4 gateway
                     return gw
     except Exception as e:
-        print(f"Warning: Could not inspect docker network 'kind' ({e}). Falling back to default gateway: {DEFAULT_GATEWAY}", file=sys.stderr)
-    return DEFAULT_GATEWAY
+        raise RuntimeError(f"Failed to inspect docker network 'kind': {e}. Ensure the kind cluster is created and running.")
+    raise RuntimeError("No IPv4 gateway found in 'docker network inspect kind' IPAM configuration.")
 
 def main():
     # 1. Generate secret.yaml from .env

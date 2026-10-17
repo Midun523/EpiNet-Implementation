@@ -244,10 +244,17 @@ def _run_full_analysis(content: bytes, analysis_id: Optional[str] = None) -> dic
     }
 
 
+class TransientBackendError(ValueError):
+    """WHY: Distinguishes transient infrastructure outages (e.g. backend pod restart)
+    from permanent data errors (e.g. malformed CSV), preventing premature job failure.
+    Inherits from ValueError for backward compatibility with caller exception hierarchies."""
+    pass
+
+
 def _fetch_csv_from_backend(
     analysis_id: str,
-    max_attempts: int = 3,
-    backoffs: tuple[int, ...] = (2, 5, 10),
+    max_attempts: int = 15,
+    backoffs: tuple[int, ...] = (2, 3, 5, 5, 5, 5, 5, 5, 10, 10),
     timeout: int = 60,
 ) -> bytes:
     """
@@ -255,9 +262,9 @@ def _fetch_csv_from_backend(
     Kafka's 1 MB message limit. This fetches the CSV bytes from the backend's
     internal endpoint using stdlib urllib.
 
-    Resilience: Retries up to max_attempts (default 3) with backoff (default 2/5/10 s)
-    and a 60s timeout per attempt to gracefully absorb transient disk/DB flush stalls
-    in the backend before publishing a FAILED event.
+    Resilience: Retries over a >= 60 s window (up to 15 attempts, total backoff > 65s)
+    to gracefully absorb a full backend JVM pod restart / cold start (~31-35s)
+    without terminating the analysis as FAILED.
     """
     url = f"{BACKEND_URL}/api/internal/analyses/{analysis_id}/data"
     req = urllib.request.Request(url)
@@ -289,7 +296,7 @@ def _fetch_csv_from_backend(
                     attempt, max_attempts, analysis_id, e,
                 )
 
-    raise ValueError(f"Failed to fetch CSV for {analysis_id} after {max_attempts} attempts: {last_error}")
+    raise TransientBackendError(f"Failed to fetch CSV for {analysis_id} after {max_attempts} attempts: {last_error}")
 
 
 def _fetch_status_from_backend(analysis_id: str) -> Optional[str]:
@@ -346,7 +353,9 @@ async def _kafka_consumer_loop():
                 value_deserializer=lambda m: json.loads(m.decode("utf-8")),
                 key_deserializer=lambda m: m.decode("utf-8") if m else None,
                 auto_offset_reset="earliest",
-                enable_auto_commit=True,
+                # WHY enable_auto_commit=False: guarantees at-least-once processing.
+                # Offsets are committed ONLY after the analysis result is published or terminal state confirmed.
+                enable_auto_commit=False,
             )
             producer = AIOKafkaProducer(
                 bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
@@ -384,6 +393,7 @@ async def _kafka_consumer_loop():
             analysis_id = event.get("analysisId")
             if not analysis_id:
                 logger.warning("Received event without analysisId: %s", event)
+                await consumer.commit()
                 continue
 
             logger.info("Received analysis.requested for %s", analysis_id)
@@ -401,6 +411,7 @@ async def _kafka_consumer_loop():
                     "Skipping analysis %s: already in terminal state %s",
                     analysis_id, current_status,
                 )
+                await consumer.commit()
                 continue
 
             JOBS_IN_PROGRESS.inc()
@@ -432,15 +443,30 @@ async def _kafka_consumer_loop():
                 t_pub = time.time() - t_pub_start
                 logger.info("STAGE TIMING: Job %s result_write_back_publish=%.3fs", analysis_id, t_pub)
 
+                # WHY commit after publish: message is acknowledged only once the downstream
+                # event is confirmed written to Kafka. If this pod is killed before this point,
+                # Kafka redelivers the message to a replacement worker.
+                await consumer.commit()
+                logger.info("Committed Kafka offset for completed analysis %s", analysis_id)
+
+            except TransientBackendError as te:
+                # Transient error: backend is restarting or temporarily unreachable.
+                # Do NOT publish FAILED. Do NOT commit offset so Kafka will redeliver to
+                # this or a replacement worker once the backend is ready.
+                logger.warning(
+                    "Transient backend error for %s: %s. Leaving offset uncommitted for redelivery.",
+                    analysis_id, te,
+                )
+                await asyncio.sleep(5)
+
             except Exception as e:
+                # Permanent data error (e.g. malformed CSV, invalid columns, math failure):
+                # Publish FAILED and commit offset so poison messages are not retried in an infinite loop.
                 duration = time.time() - t_start
                 ANALYSIS_DURATION_SECONDS.observe(duration)
                 JOBS_PROCESSED_TOTAL.labels(status="failure").inc()
 
-                logger.error("Analysis %s failed: %s", analysis_id, str(e), exc_info=True)
-
-                # WHY publish FAILED: if we don't, the job stays PENDING forever
-                # and the frontend polls until its 5-minute timeout.
+                logger.error("Permanent analysis failure for %s: %s", analysis_id, str(e), exc_info=True)
                 failure_event = {
                     "analysisId": analysis_id,
                     "status": "FAILED",
@@ -453,7 +479,8 @@ async def _kafka_consumer_loop():
                         key=analysis_id,
                         value=failure_event,
                     )
-                    logger.info("Published FAILED event for %s", analysis_id)
+                    await consumer.commit()
+                    logger.info("Published FAILED event and committed offset for %s", analysis_id)
                 except Exception as pub_err:
                     logger.error(
                         "Could not publish FAILED event for %s: %s",

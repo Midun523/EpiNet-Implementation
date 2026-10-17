@@ -75,4 +75,10 @@ public interface AnalysisRunRepository extends JpaRepository<AnalysisRun, String
             @Param("errorMessage") String errorMessage,
             @Param("completedAt") LocalDateTime completedAt
     );
+
+    /**
+     * WHY findStuckProcessingJobs: Queries jobs remaining in PROCESSING status created prior to cutoff time.
+     */
+    @Query("SELECT a FROM AnalysisRun a WHERE a.status = com.epinet.model.AnalysisRun$Status.PROCESSING AND a.createdAt < :cutoff")
+    List<AnalysisRun> findStuckProcessingJobs(@Param("cutoff") LocalDateTime cutoff);
 }

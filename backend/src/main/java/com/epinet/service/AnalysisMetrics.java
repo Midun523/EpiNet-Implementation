@@ -2,6 +2,7 @@ package com.epinet.service;
 
 import com.epinet.model.AnalysisRun;
 import com.epinet.repository.AnalysisRunRepository;
+import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
@@ -18,16 +19,21 @@ import java.time.Duration;
  *    COMPLETED, FAILED) queried dynamically on scrape from the repository.
  * 2. Exposes a Micrometer Timer recording end-to-end analysis job duration
  *    from job creation to final completion or failure.
+ * 3. Exposes a Counter tracking jobs recovered from stuck PROCESSING state.
  */
 @Component
 public class AnalysisMetrics {
 
     private final MeterRegistry meterRegistry;
     private final AnalysisRunRepository repository;
+    private final Counter stuckJobsCounter;
 
     public AnalysisMetrics(MeterRegistry meterRegistry, AnalysisRunRepository repository) {
         this.meterRegistry = meterRegistry;
         this.repository = repository;
+        this.stuckJobsCounter = Counter.builder("epinet.stuck.jobs.timed.out.total")
+                .description("Total number of analysis jobs transitioned to FAILED due to stuck PROCESSING timeout")
+                .register(meterRegistry);
     }
 
     @PostConstruct
@@ -62,5 +68,12 @@ public class AnalysisMetrics {
                 .tag("status", status)
                 .register(meterRegistry)
                 .record(duration);
+    }
+
+    /**
+     * Records a job timeout by incrementing the epinet.stuck.jobs.timed.out.total counter.
+     */
+    public void recordStuckJobTimedOut() {
+        stuckJobsCounter.increment();
     }
 }

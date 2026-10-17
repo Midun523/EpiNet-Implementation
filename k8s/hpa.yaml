@@ -1,32 +1,9 @@
-# k8s/hpa.yaml — Horizontal Pod Autoscalers for backend and ml-service (Phase 4)
-# WHY: automatically scales replicas based on CPU utilization during heavy computational loads or uploads.
+# k8s/hpa.yaml — Horizontal Pod Autoscaler for ml-service (Phase 4)
+# WHY: automatically scales ml-service replicas based on CPU utilization during computational loads.
+# WHY NO BACKEND HPA: Backend is pinned to 1 replica (maxReplicas=1 was meaningless for an HPA).
+# Bounding backend to 1 replica (2Gi limit) and autoscaling only ml-service (up to 3 replicas at 512Mi each)
+# keeps total cluster limit at ~6.35 GiB, well within the 7.57 GiB Docker VM without memory pressure or swap.
 
-apiVersion: autoscaling/v2
-kind: HorizontalPodAutoscaler
-metadata:
-  name: backend-hpa
-  labels:
-    app.kubernetes.io/name: backend
-    app.kubernetes.io/part-of: epinet
-spec:
-  scaleTargetRef:
-    apiVersion: apps/v1
-    kind: Deployment
-    name: backend
-  minReplicas: 1
-  # WHY maxReplicas=1: bounds backend memory to 2Gi max; combined with 3 ml-service replicas (3Gi),
-  # frontend (128Mi), and Compose infrastructure (MySQL 1.05Gi + Kafka 820Mi + kind node 750Mi = 2.62Gi),
-  # total worst-case allocation is ~7.75 GiB, safely fitting within the 7.57 GiB Docker VM.
-  maxReplicas: 1
-  metrics:
-  - type: Resource
-    resource:
-      name: cpu
-      target:
-        type: Utilization
-        # WHY 60%: triggers scale-out when CPU usage exceeds 60% of request (150m) during concurrent uploads
-        averageUtilization: 60
----
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
@@ -48,5 +25,5 @@ spec:
       name: cpu
       target:
         type: Utilization
-        # WHY 60%: triggers scale-out when CPU usage exceeds 60% of request (150m) during multi-pair epistasis regression
+        # WHY 60%: triggers scale-out when CPU usage exceeds 60% of request (250m) during multi-pair epistasis regression
         averageUtilization: 60
