@@ -241,6 +241,35 @@ def test_fetch_csv_fails_after_exhausting_all_retries():
         assert mock_sleep.call_args_list == [((2,),), ((5,),)]
 
 
+def test_fetch_csv_aborts_early_when_transient_timeout_exceeded():
+    """
+    REGRESSION TEST: Ensures that _fetch_csv_from_backend does NOT block for all
+    15 attempts (95s) when TRANSIENT_RETRY_TIMEOUT_SECONDS is lower (e.g. 5s).
+    It must abort early and raise TransientBackendError after elapsed exceeds timeout.
+    """
+    import urllib.error
+    from unittest.mock import patch
+    from main import _fetch_csv_from_backend, TransientBackendError
+
+    # Simulate time advancing by 3s on each attempt
+    clock = [100.0]
+    def fake_time():
+        t = clock[0]
+        clock[0] += 3.0
+        return t
+
+    with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("connection refused")) as mock_urlopen, \
+         patch("time.sleep"), \
+         patch("time.time", side_effect=fake_time), \
+         patch("main.TRANSIENT_RETRY_TIMEOUT_SECONDS", 5.0):
+
+        with pytest.raises(TransientBackendError, match="Failed to fetch CSV for test-timeout-abort after 2 attempts"):
+            _fetch_csv_from_backend("test-timeout-abort", max_attempts=15)
+
+        # Must have stopped at attempt 2 (elapsed 6s > 5s limit) rather than running all 15 attempts!
+        assert mock_urlopen.call_count == 2
+
+
 def test_transient_backend_error_seeks_back_and_does_not_publish_failed_or_commit():
     """
     WHY: Item 1 test. Verifies that when _fetch_csv_from_backend raises TransientBackendError,
