@@ -128,15 +128,26 @@ class AnalysisRunRepositoryTest {
     @Test
     @DisplayName("findStuckProcessingJobs returns only PROCESSING jobs created before cutoff")
     void findStuckProcessingJobs_returnsMatchingJobs() {
-        // Cutoff is 1 minute in the future, so the processing job created during setUp matches
         LocalDateTime cutoffFuture = LocalDateTime.now().plusMinutes(1);
         var stuck = repo.findStuckProcessingJobs(cutoffFuture);
         assertThat(stuck).hasSize(1);
         assertThat(stuck.get(0).getId()).isEqualTo(processingId);
 
-        // Cutoff is 1 hour in the past, so no jobs match
         LocalDateTime cutoffPast = LocalDateTime.now().minusHours(1);
         var noneStuck = repo.findStuckProcessingJobs(cutoffPast);
+        assertThat(noneStuck).isEmpty();
+    }
+
+    @Test
+    @DisplayName("findStuckPendingJobs returns only PENDING jobs created before cutoff")
+    void findStuckPendingJobs_returnsMatchingJobs() {
+        LocalDateTime cutoffFuture = LocalDateTime.now().plusMinutes(1);
+        var stuck = repo.findStuckPendingJobs(cutoffFuture);
+        assertThat(stuck).hasSize(1);
+        assertThat(stuck.get(0).getId()).isEqualTo(pendingId);
+
+        LocalDateTime cutoffPast = LocalDateTime.now().minusHours(1);
+        var noneStuck = repo.findStuckPendingJobs(cutoffPast);
         assertThat(noneStuck).isEmpty();
     }
 }

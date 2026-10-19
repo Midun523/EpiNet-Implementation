@@ -254,7 +254,9 @@ class TransientBackendError(ValueError):
 def _fetch_csv_from_backend(
     analysis_id: str,
     max_attempts: int = 15,
-    backoffs: tuple[int, ...] = (2, 3, 5, 5, 5, 5, 5, 5, 10, 10),
+    # WHY backoffs: 14 intervals for 15 attempts summing to 95 s (2+3+30+60).
+    # Attempts 11-14 each wait 10s. Exceeds the ~33s backend cold start with >60s margin.
+    backoffs: tuple[int, ...] = (2, 3, 5, 5, 5, 5, 5, 5, 10, 10, 10, 10, 10, 10),
     timeout: int = 60,
 ) -> bytes:
     """
@@ -262,9 +264,9 @@ def _fetch_csv_from_backend(
     Kafka's 1 MB message limit. This fetches the CSV bytes from the backend's
     internal endpoint using stdlib urllib.
 
-    Resilience: Retries over a >= 60 s window (up to 15 attempts, total backoff > 65s)
+    Resilience: Retries over a 95 s window (15 attempts with backoffs summing to 95s)
     to gracefully absorb a full backend JVM pod restart / cold start (~31-35s)
-    without terminating the analysis as FAILED.
+    with >60s safety margin without terminating the analysis as FAILED.
     """
     url = f"{BACKEND_URL}/api/internal/analyses/{analysis_id}/data"
     req = urllib.request.Request(url)
@@ -339,7 +341,7 @@ async def _kafka_consumer_loop():
     letting the message sit unconsumed. This ensures the backend marks the job
     as FAILED and the frontend stops polling.
     """
-    from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
+    from aiokafka import AIOKafkaConsumer, AIOKafkaProducer, TopicPartition
 
     # WHY retry loop: Kafka may not be ready when the service starts
     consumer = None
@@ -450,13 +452,17 @@ async def _kafka_consumer_loop():
                 logger.info("Committed Kafka offset for completed analysis %s", analysis_id)
 
             except TransientBackendError as te:
-                # Transient error: backend is restarting or temporarily unreachable.
-                # Do NOT publish FAILED. Do NOT commit offset so Kafka will redeliver to
-                # this or a replacement worker once the backend is ready.
+                # WHY seek back: in aiokafka, iterating `async for msg in consumer` advances the
+                # internal position to msg.offset + 1. If we only sleep and continue, the consumer
+                # will fetch subsequent messages and a later commit() would permanently skip this
+                # failed message! Seeking back explicitly to msg.offset ensures the consumer retries
+                # this message on the next loop iteration.
                 logger.warning(
-                    "Transient backend error for %s: %s. Leaving offset uncommitted for redelivery.",
-                    analysis_id, te,
+                    "Transient backend error for %s: %s. Seeking back to partition %d offset %d for in-pod redelivery.",
+                    analysis_id, te, msg.partition, msg.offset,
                 )
+                tp = TopicPartition(msg.topic, msg.partition)
+                consumer.seek(tp, msg.offset)
                 await asyncio.sleep(5)
 
             except Exception as e:

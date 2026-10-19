@@ -81,4 +81,10 @@ public interface AnalysisRunRepository extends JpaRepository<AnalysisRun, String
      */
     @Query("SELECT a FROM AnalysisRun a WHERE a.status = com.epinet.model.AnalysisRun$Status.PROCESSING AND a.createdAt < :cutoff")
     List<AnalysisRun> findStuckProcessingJobs(@Param("cutoff") LocalDateTime cutoff);
+
+    /**
+     * WHY findStuckPendingJobs: Queries jobs remaining in PENDING status created prior to cutoff time.
+     */
+    @Query("SELECT a FROM AnalysisRun a WHERE a.status = com.epinet.model.AnalysisRun$Status.PENDING AND a.createdAt < :cutoff")
+    List<AnalysisRun> findStuckPendingJobs(@Param("cutoff") LocalDateTime cutoff);
 }

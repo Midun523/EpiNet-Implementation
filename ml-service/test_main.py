@@ -240,3 +240,65 @@ def test_fetch_csv_fails_after_exhausting_all_retries():
         assert mock_sleep.call_count == 2
         assert mock_sleep.call_args_list == [((2,),), ((5,),)]
 
+
+def test_transient_backend_error_seeks_back_and_does_not_publish_failed_or_commit():
+    """
+    WHY: Item 1 test. Verifies that when _fetch_csv_from_backend raises TransientBackendError,
+    the consumer seeks back to the message offset, does NOT publish a FAILED event to
+    'analysis.completed', and does NOT commit the consumer offset.
+    This proves the consumer retries indefinitely (blocking the partition) rather than
+    abandoning the job as FAILED.
+    """
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from aiokafka import TopicPartition
+    from main import TransientBackendError, _kafka_consumer_loop
+
+    # Create mock message
+    msg = MagicMock()
+    msg.topic = "analysis.requested"
+    msg.partition = 1
+    msg.offset = 42
+    msg.value = {"analysisId": "test-transient-123"}
+
+    # Mock consumer
+    consumer = MagicMock()
+    consumer.start = AsyncMock()
+    consumer.stop = AsyncMock()
+    consumer.commit = AsyncMock()
+    consumer.seek = MagicMock()
+
+    # Async generator that yields msg once, then breaks by raising asyncio.CancelledError
+    async def msg_generator():
+        yield msg
+        raise asyncio.CancelledError()
+
+    consumer.__aiter__ = lambda self: msg_generator()
+
+    # Mock producer
+    producer = MagicMock()
+    producer.start = AsyncMock()
+    producer.stop = AsyncMock()
+    producer.send_and_wait = AsyncMock()
+
+    with patch("aiokafka.AIOKafkaConsumer", return_value=consumer), \
+         patch("aiokafka.AIOKafkaProducer", return_value=producer), \
+         patch("main._fetch_status_from_backend", return_value=None), \
+         patch("main._fetch_csv_from_backend", side_effect=TransientBackendError("Connection refused")), \
+         patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+
+        try:
+            asyncio.run(_kafka_consumer_loop())
+        except asyncio.CancelledError:
+            pass
+
+        # 1. Consumer seek MUST be called with partition and offset
+        consumer.seek.assert_called_once_with(TopicPartition("analysis.requested", 1), 42)
+
+        # 2. Producer send_and_wait MUST NOT be called (never publish FAILED)
+        producer.send_and_wait.assert_not_called()
+
+        # 3. Consumer commit MUST NOT be called (message remains uncommitted)
+        consumer.commit.assert_not_called()
+
+
