@@ -302,3 +302,69 @@ def test_transient_backend_error_seeks_back_and_does_not_publish_failed_or_commi
         consumer.commit.assert_not_called()
 
 
+def test_transient_backend_error_publishes_failed_and_commits_when_timeout_exceeded():
+    """
+    WHY: Item 2 test. Verifies that when transient failures persist beyond
+    TRANSIENT_RETRY_TIMEOUT_SECONDS for the same message, the consumer breaks the
+    retry loop, publishes a FAILED event to 'analysis.completed', and commits
+    the consumer offset so subsequent messages on the same partition are not blocked.
+    """
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from aiokafka import TopicPartition
+    from main import TransientBackendError, _kafka_consumer_loop
+
+    msg = MagicMock()
+    msg.topic = "analysis.requested"
+    msg.partition = 1
+    msg.offset = 42
+    msg.timestamp = 1000000
+    msg.value = {"analysisId": "test-exhausted-timeout-789"}
+
+    consumer = MagicMock()
+    consumer.start = AsyncMock()
+    consumer.stop = AsyncMock()
+    consumer.commit = AsyncMock()
+    consumer.seek = MagicMock()
+
+    async def msg_generator():
+        yield msg
+        raise asyncio.CancelledError()
+
+    consumer.__aiter__ = lambda self: msg_generator()
+
+    producer = MagicMock()
+    producer.start = AsyncMock()
+    producer.stop = AsyncMock()
+    producer.send_and_wait = AsyncMock()
+
+    with patch("aiokafka.AIOKafkaConsumer", return_value=consumer), \
+         patch("aiokafka.AIOKafkaProducer", return_value=producer), \
+         patch("main._fetch_status_from_backend", return_value=None), \
+         patch("main._fetch_csv_from_backend", side_effect=TransientBackendError("Connection refused")), \
+         patch("main.TRANSIENT_RETRY_TIMEOUT_SECONDS", -1.0):
+
+        try:
+            asyncio.run(_kafka_consumer_loop())
+        except asyncio.CancelledError:
+            pass
+
+        # 1. Producer send_and_wait MUST be called to publish FAILED status
+        producer.send_and_wait.assert_called_once()
+        call_args = producer.send_and_wait.call_args
+        topic, = call_args[0]
+        assert topic == "analysis.completed"
+        published_event = call_args[1]["value"]
+        assert published_event["analysisId"] == "test-exhausted-timeout-789"
+        assert published_event["status"] == "FAILED"
+        assert "transient retries exhausted" in published_event["errorMessage"]
+        assert "Partition unblocked" in published_event["errorMessage"]
+
+        # 2. Consumer commit MUST be called to advance past this failed message
+        consumer.commit.assert_called_once()
+
+        # 3. Consumer seek MUST NOT be called because message was committed rather than seeked back
+        consumer.seek.assert_not_called()
+
+
+

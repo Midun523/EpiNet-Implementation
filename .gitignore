@@ -45,3 +45,6 @@ k8s/secret.yaml
 *.secret.yaml
 k8s/backend-deployment.yaml
 k8s/ml-service-deployment.yaml
+
+# ─── Benchmark & Experiment Results ─────────────────
+results/

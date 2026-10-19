@@ -82,6 +82,9 @@ JOBS_IN_PROGRESS = Gauge(
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8080")
 KAFKA_ENABLED = os.getenv("KAFKA_ENABLED", "true").lower() == "true"
+# WHY: Maximum time window to retry transient backend errors before giving up,
+# publishing FAILED, and committing the Kafka offset to unblock the partition.
+TRANSIENT_RETRY_TIMEOUT_SECONDS = float(os.getenv("TRANSIENT_RETRY_TIMEOUT_SECONDS", "600"))
 
 # The 10 pharmacogenomic genes this service expects
 EXPECTED_GENES = [
@@ -285,20 +288,22 @@ def _fetch_csv_from_backend(
                 return data
         except Exception as e:
             last_error = e
-            if attempt < max_attempts:
+            elapsed = time.time() - t0
+            if attempt < max_attempts and elapsed < TRANSIENT_RETRY_TIMEOUT_SECONDS:
                 sleep_sec = backoffs[attempt - 1] if attempt - 1 < len(backoffs) else backoffs[-1]
                 logger.warning(
-                    "Fetch attempt %d/%d failed for job %s: %s. Retrying in %ds...",
-                    attempt, max_attempts, analysis_id, e, sleep_sec,
+                    "Fetch attempt %d/%d failed for job %s: %s (elapsed %.1fs/%.1fs). Retrying in %ds...",
+                    attempt, max_attempts, analysis_id, e, elapsed, TRANSIENT_RETRY_TIMEOUT_SECONDS, sleep_sec,
                 )
                 time.sleep(sleep_sec)
             else:
                 logger.error(
-                    "Fetch attempt %d/%d failed for job %s: %s. All retries exhausted.",
-                    attempt, max_attempts, analysis_id, e,
+                    "Fetch attempt %d/%d failed for job %s: %s (elapsed %.1fs/%.1fs). All retries or timeout exhausted.",
+                    attempt, max_attempts, analysis_id, e, elapsed, TRANSIENT_RETRY_TIMEOUT_SECONDS,
                 )
+                break
 
-    raise TransientBackendError(f"Failed to fetch CSV for {analysis_id} after {max_attempts} attempts: {last_error}")
+    raise TransientBackendError(f"Failed to fetch CSV for {analysis_id} after {attempt} attempts: {last_error}")
 
 
 def _fetch_status_from_backend(analysis_id: str) -> Optional[str]:
@@ -388,6 +393,7 @@ async def _kafka_consumer_loop():
         return
 
     loop = asyncio.get_event_loop()
+    transient_first_failure: dict[tuple[str, int, int], float] = {}
 
     try:
         async for msg in consumer:
@@ -413,6 +419,7 @@ async def _kafka_consumer_loop():
                     "Skipping analysis %s: already in terminal state %s",
                     analysis_id, current_status,
                 )
+                transient_first_failure.pop((msg.topic, msg.partition, msg.offset), None)
                 await consumer.commit()
                 continue
 
@@ -448,22 +455,56 @@ async def _kafka_consumer_loop():
                 # WHY commit after publish: message is acknowledged only once the downstream
                 # event is confirmed written to Kafka. If this pod is killed before this point,
                 # Kafka redelivers the message to a replacement worker.
+                transient_first_failure.pop((msg.topic, msg.partition, msg.offset), None)
                 await consumer.commit()
                 logger.info("Committed Kafka offset for completed analysis %s", analysis_id)
 
             except TransientBackendError as te:
-                # WHY seek back: in aiokafka, iterating `async for msg in consumer` advances the
-                # internal position to msg.offset + 1. If we only sleep and continue, the consumer
-                # will fetch subsequent messages and a later commit() would permanently skip this
-                # failed message! Seeking back explicitly to msg.offset ensures the consumer retries
-                # this message on the next loop iteration.
-                logger.warning(
-                    "Transient backend error for %s: %s. Seeking back to partition %d offset %d for in-pod redelivery.",
-                    analysis_id, te, msg.partition, msg.offset,
-                )
-                tp = TopicPartition(msg.topic, msg.partition)
-                consumer.seek(tp, msg.offset)
-                await asyncio.sleep(5)
+                msg_key = (msg.topic, msg.partition, msg.offset)
+                t_first = transient_first_failure.setdefault(msg_key, t_start)
+                elapsed = time.time() - t_first
+
+                if elapsed >= TRANSIENT_RETRY_TIMEOUT_SECONDS:
+                    # Retry window exhausted: publish FAILED and commit offset to avoid permanent partition blocking
+                    logger.error(
+                        "Transient retry window (%.1fs > %.1fs) exhausted for %s (partition %d offset %d). "
+                        "Publishing FAILED and committing offset to unblock partition.",
+                        elapsed, TRANSIENT_RETRY_TIMEOUT_SECONDS, analysis_id, msg.partition, msg.offset,
+                    )
+                    transient_first_failure.pop(msg_key, None)
+
+                    duration = time.time() - t_start
+                    ANALYSIS_DURATION_SECONDS.observe(duration)
+                    JOBS_PROCESSED_TOTAL.labels(status="failure").inc()
+
+                    failure_event = {
+                        "analysisId": analysis_id,
+                        "status": "FAILED",
+                        "resultJson": None,
+                        "errorMessage": (
+                            f"Backend unavailable: transient retries exhausted after {int(elapsed)}s "
+                            f"(limit {int(TRANSIENT_RETRY_TIMEOUT_SECONDS)}s). Partition unblocked."
+                        ),
+                    }
+                    try:
+                        await producer.send_and_wait(
+                            "analysis.completed",
+                            key=analysis_id,
+                            value=failure_event,
+                        )
+                        await consumer.commit()
+                        logger.info("Committed offset %d after exhausted transient retries for %s", msg.offset, analysis_id)
+                    except Exception as pub_err:
+                        logger.error("Failed to publish FAILED event for %s: %s", analysis_id, pub_err)
+                else:
+                    logger.warning(
+                        "Transient backend error for %s: %s (retried %.1fs / limit %.1fs). "
+                        "Seeking back to partition %d offset %d for in-pod redelivery.",
+                        analysis_id, te, elapsed, TRANSIENT_RETRY_TIMEOUT_SECONDS, msg.partition, msg.offset,
+                    )
+                    tp = TopicPartition(msg.topic, msg.partition)
+                    consumer.seek(tp, msg.offset)
+                    await asyncio.sleep(5)
 
             except Exception as e:
                 # Permanent data error (e.g. malformed CSV, invalid columns, math failure):

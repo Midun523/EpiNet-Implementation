@@ -43,6 +43,12 @@ spec:
             configMapKeyRef:
               name: epinet-config
               key: KAFKA_BOOTSTRAP_SERVERS
+        # WHY OMP_NUM_THREADS/OPENBLAS_NUM_THREADS=1: Prevents 16-thread oversubscription against 1500m CFS quota;
+        # eliminates CPU throttling (0 throttled periods vs 122) and reduces 40 MB compute time from 12.98s to 1.98s.
+        - name: OMP_NUM_THREADS
+          value: "1"
+        - name: OPENBLAS_NUM_THREADS
+          value: "1"
         resources:
           # WHY requests/limits: measured peak RSS is ~119-146 MiB under 40 MB jobs; 512Mi limit provides >2.8x headroom
           requests:
