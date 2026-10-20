@@ -20,6 +20,7 @@ labeled with mandatory caption:
 """
 
 import csv
+import datetime
 import glob
 import json
 import math
@@ -129,18 +130,26 @@ def process_all_results():
         sys_f = os.path.join(RESULTS_DIR, f"{basename}_system.csv")
         
         # Parse run_id: {cond}_{mb}mb_{vus}vu_rep{r}_{ts}
-        parts = basename.split("_")
-        if len(parts) < 4:
+        if basename.startswith("kafka_fixed1_"):
+            cond = "kafka_fixed1"
+            rest = basename[len("kafka_fixed1_"):]
+        elif basename.startswith("kafka_hpa_"):
+            cond = "kafka_hpa"
+            rest = basename[len("kafka_hpa_"):]
+        elif basename.startswith("sync_"):
+            cond = "sync"
+            rest = basename[len("sync_"):]
+        else:
             continue
-        cond = parts[0]
-        mb_str = parts[1].replace("mb", "")
-        vus_str = parts[2].replace("vu", "")
-        rep_str = parts[3].replace("rep", "")
-        
+            
+        parts = rest.split("_")
+        if len(parts) < 3:
+            continue
+            
         try:
-            mb = int(mb_str)
-            vus = int(vus_str)
-            rep = int(rep_str)
+            mb = int(parts[0].replace("mb", ""))
+            vus = int(parts[1].replace("vu", ""))
+            rep = int(parts[2].replace("rep", ""))
         except ValueError:
             continue
             
@@ -148,8 +157,17 @@ def process_all_results():
         job_p50, job_p95, comp_jobs, failed_jobs = parse_jobs(jf)
         max_reps, restarts, oom, min_free, ts_data = parse_system(sys_f) if os.path.exists(sys_f) else (1, 0, 0, 0, [])
         
-        # duration assumed 60s
-        throughput = (comp_jobs / 60.0) * 60.0
+        # Calculate throughput (jobs/min) from actual trial duration
+        if len(ts_data) > 1 and ts_data[0][0] and ts_data[-1][0]:
+            try:
+                t0 = datetime.datetime.fromisoformat(ts_data[0][0])
+                t1 = datetime.datetime.fromisoformat(ts_data[-1][0])
+                actual_dur = max(10.0, (t1 - t0).total_seconds())
+            except Exception:
+                actual_dur = 60.0
+        else:
+            actual_dur = 60.0
+        throughput = (comp_jobs / actual_dur) * 60.0
         
         trials.append({
             "run_id": basename,
@@ -240,19 +258,50 @@ def generate_charts(summary_data):
     plt.close()
     print(f"[CHART] Generated: {p2}")
 
-    # Chart 3: Replicas Over Time Under Sustained Load
+    # Chart 3: Replicas Over Time Under Sustained Load (from real system monitor CSV)
     fig, ax = plt.subplots(figsize=(9, 5.0), dpi=300)
-    t_seconds = np.arange(0, 120, 2)
-    # Replicas curve showing horizontal autoscaling transition under load
-    hpa_reps = [1 if t < 20 else 2 if t < 50 else 3 if t < 90 else 3 for t in t_seconds]
-    fixed_reps = [1 for _ in t_seconds]
     
-    ax.step(t_seconds, hpa_reps, where="post", color="#5cb85c", linewidth=2.5, label="HPA Active Replicas (Scales 1 -> 2 -> 3)")
-    ax.step(t_seconds, fixed_reps, where="post", color="#0275d8", linewidth=2.0, linestyle=":", label="Fixed Allocation (1 Replica)")
+    def load_system_timeseries(condition_prefix):
+        files = glob.glob(os.path.join(RESULTS_DIR, f"{condition_prefix}_*system.csv"))
+        if not files:
+            return [], []
+        # Prefer higher load files (8vu, then 4vu)
+        files.sort(key=lambda x: ("8vu" in x, "4vu" in x, "2vu" in x), reverse=True)
+        target_file = files[0]
+        t_rel = []
+        replicas = []
+        start_dt = None
+        with open(target_file, "r", encoding="utf-8", errors="ignore") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                ts_str = row.get("timestamp_utc")
+                if not ts_str:
+                    continue
+                try:
+                    dt = datetime.datetime.fromisoformat(ts_str)
+                except ValueError:
+                    continue
+                if start_dt is None:
+                    start_dt = dt
+                elapsed = (dt - start_dt).total_seconds()
+                t_rel.append(elapsed)
+                try:
+                    replicas.append(int(row.get("ml_ready_replicas", 1)))
+                except ValueError:
+                    replicas.append(1)
+        return t_rel, replicas
+
+    hpa_t, hpa_reps = load_system_timeseries("kafka_hpa")
+    fixed_t, fixed_reps = load_system_timeseries("kafka_fixed1")
+
+    if hpa_t and hpa_reps:
+        ax.step(hpa_t, hpa_reps, where="post", color="#5cb85c", linewidth=2.5, label="HPA Active Replicas")
+    if fixed_t and fixed_reps:
+        ax.step(fixed_t, fixed_reps, where="post", color="#0275d8", linewidth=2.0, linestyle=":", label="Fixed Allocation (1 Replica)")
     
     ax.set_title("Kubernetes Horizontal Pod Autoscaling (HPA) Elasticity", fontsize=14, fontweight="bold", pad=12)
     ax.set_ylabel("Ready Pod Replicas", fontsize=11)
-    ax.set_xlabel("Time under 8 VU Load (seconds)", fontsize=11)
+    ax.set_xlabel("Time under Sustained Load (seconds)", fontsize=11)
     ax.set_ylim(0.5, 3.5)
     ax.yaxis.set_major_locator(ticker.MaxNLocator(integer=True))
     ax.legend(frameon=True, loc="upper left", fontsize=10)
@@ -263,17 +312,37 @@ def generate_charts(summary_data):
     plt.close()
     print(f"[CHART] Generated: {p3}")
 
-    # Chart 4: Recovery Timeline from Pod-Kill Trials (Single-Clock Milestone)
-    fig, ax = plt.subplots(figsize=(9.5, 4.8), dpi=300)
+    # Chart 4: Recovery Timeline from Pod-Kill Trials (Loaded from real recovery trial data)
+    recovery_file = os.path.join(RESULTS_DIR, "ml_pod_recovery_trials.json")
+    if not os.path.exists(recovery_file):
+        raise RuntimeError(f"Missing real recovery trial data at {recovery_file}")
+
+    with open(recovery_file, "r") as f:
+        trials_json = json.load(f)
+    
+    # Extract real milestones from trial 1
+    t1 = trials_json[0]
+    t_kill_dt = datetime.datetime.fromisoformat(t1["t_kill"])
+    t_created_dt = datetime.datetime.fromisoformat(t1["t_pod_created"])
+    t_started_dt = datetime.datetime.fromisoformat(t1["t_container_started"])
+    t_ready_dt = datetime.datetime.fromisoformat(t1["t_pod_ready"])
+    t_terminal_dt = datetime.datetime.fromisoformat(t1["t_terminal"])
+
+    d_kill = 0.0
+    d_created = max(0.1, (t_created_dt - t_kill_dt).total_seconds())
+    d_started = max(d_created + 0.2, (t_started_dt - t_kill_dt).total_seconds())
+    d_ready = (t_ready_dt - t_kill_dt).total_seconds()
+    d_terminal = (t_terminal_dt - t_kill_dt).total_seconds()
+
     milestones = [
-        ("Pod Kill Signal Sent", 0.0, "#d9534f"),
-        ("Replacement Pod Created", 0.84, "#f0ad4e"),
-        ("Container Started", 1.26, "#0275d8"),
-        ("Readiness Probe Passed (Ready)", 11.45, "#5bc0de"),
-        ("Kafka Re-consumption & Compute", 12.10, "#9c27b0"),
-        ("Job Terminal (COMPLETED)", 13.12, "#5cb85c")
+        ("Pod Kill Signal Sent", d_kill, "#d9534f"),
+        ("Replacement Pod Created", d_created, "#f0ad4e"),
+        ("Container Started", d_started, "#0275d8"),
+        ("Readiness Probe Passed (Ready)", d_ready, "#5bc0de"),
+        ("Job Terminal (COMPLETED)", d_terminal, "#5cb85c")
     ]
     
+    fig, ax = plt.subplots(figsize=(9.5, 4.8), dpi=300)
     y_pos = np.arange(len(milestones))
     times = [m[1] for m in milestones]
     colors = [m[2] for m in milestones]
@@ -288,7 +357,7 @@ def generate_charts(summary_data):
     ax.invert_yaxis()
     ax.set_xlabel("Elapsed Time from Pod Kill (seconds)", fontsize=11)
     ax.set_title("Single-Clock Kubernetes Pod Recovery & Job Resume Timeline", fontsize=14, fontweight="bold", pad=12)
-    ax.set_xlim(0, 16)
+    ax.set_xlim(0, max(times) + 4)
     fig.text(0.5, 0.01, CAPTION_TEXT, ha="center", fontsize=8, color="#555555", style="italic")
     plt.tight_layout(rect=[0, 0.03, 1, 0.97])
     p4 = os.path.join(RESULTS_DIR, "chart4_recovery_timeline.png")
@@ -296,82 +365,88 @@ def generate_charts(summary_data):
     plt.close()
     print(f"[CHART] Generated: {p4}")
 
+    # Copy all generated charts to docs/images/
+    docs_img_dir = os.path.abspath("docs/images")
+    os.makedirs(docs_img_dir, exist_ok=True)
+    import shutil
+    for p in [p1, p2, p3, p4]:
+        dest = os.path.join(docs_img_dir, os.path.basename(p))
+        shutil.copyfile(p, dest)
+        print(f"[DOCS] Copied {os.path.basename(p)} -> {dest}")
+
 
 def main():
     trials = process_all_results()
     if not trials:
-        print("[WARNING] No trial results found in results/. Running dry-run baseline chart generation.")
-        # Baseline dictionary structure for chart scaffolding
-        summary_data = {
-            ("sync", 2, 1): {"upload_p50": 620.0, "upload_p95": 850.0, "tp_med": 85.0},
-            ("sync", 2, 2): {"upload_p50": 1150.0, "upload_p95": 1600.0, "tp_med": 92.0},
-            ("sync", 2, 4): {"upload_p50": 2400.0, "upload_p95": 3200.0, "tp_med": 96.0},
-            ("sync", 2, 8): {"upload_p50": 5100.0, "upload_p95": 7400.0, "tp_med": 94.0},
-            ("sync", 10, 1): {"upload_p50": 2200.0, "upload_p95": 2800.0, "tp_med": 24.0},
-            ("sync", 10, 2): {"upload_p50": 4300.0, "upload_p95": 5600.0, "tp_med": 26.0},
+        raise RuntimeError("No trial results found in results/! Cannot generate summary or charts without real empirical data.")
 
-            ("kafka_fixed1", 2, 1): {"upload_p50": 125.0, "upload_p95": 190.0, "tp_med": 90.0},
-            ("kafka_fixed1", 2, 2): {"upload_p50": 130.0, "upload_p95": 210.0, "tp_med": 110.0},
-            ("kafka_fixed1", 2, 4): {"upload_p50": 142.0, "upload_p95": 235.0, "tp_med": 115.0},
-            ("kafka_fixed1", 2, 8): {"upload_p50": 168.0, "upload_p95": 290.0, "tp_med": 118.0},
-            ("kafka_fixed1", 10, 1): {"upload_p50": 480.0, "upload_p95": 720.0, "tp_med": 27.0},
-            ("kafka_fixed1", 10, 2): {"upload_p50": 510.0, "upload_p95": 810.0, "tp_med": 28.0},
-
-            ("kafka_hpa", 2, 1): {"upload_p50": 124.0, "upload_p95": 188.0, "tp_med": 91.0},
-            ("kafka_hpa", 2, 2): {"upload_p50": 129.0, "upload_p95": 205.0, "tp_med": 140.0},
-            ("kafka_hpa", 2, 4): {"upload_p50": 138.0, "upload_p95": 220.0, "tp_med": 210.0},
-            ("kafka_hpa", 2, 8): {"upload_p50": 155.0, "upload_p95": 270.0, "tp_med": 265.0},
-            ("kafka_hpa", 10, 1): {"upload_p50": 475.0, "upload_p95": 710.0, "tp_med": 28.0},
-            ("kafka_hpa", 10, 2): {"upload_p50": 495.0, "upload_p95": 780.0, "tp_med": 52.0},
+    # Group by (condition, file_mb, vus)
+    grouped = {}
+    for t in trials:
+        key = (t["condition"], t["file_mb"], t["vus"])
+        grouped.setdefault(key, []).append(t)
+        
+    summary_data = {}
+    summary_csv_rows = []
+    for key, rows in grouped.items():
+        cond, mb, vus = key
+        up_p50s = [r["upload_p50_ms"] for r in rows if r["upload_p50_ms"] > 0] or [0.0]
+        up_p95s = [r["upload_p95_ms"] for r in rows if r["upload_p95_ms"] > 0] or [0.0]
+        tps = [r["throughput_jobs_per_min"] for r in rows]
+        job_p50s = [r["job_p50_sec"] for r in rows if r["job_p50_sec"] > 0] or [0.0]
+        job_p95s = [r["job_p95_sec"] for r in rows if r["job_p95_sec"] > 0] or [0.0]
+        restarts = [r["restarts"] for r in rows]
+        ooms = [r["oom_killed"] for r in rows]
+        free_mbs = [r["min_vm_free_mb"] for r in rows if r["min_vm_free_mb"] > 0] or [0]
+        failed_sum = sum(r["failed_jobs"] for r in rows)
+        
+        med_up_p50 = float(np.median(up_p50s))
+        med_up_p95 = float(np.median(up_p95s))
+        med_tp = float(np.median(tps))
+        med_job_p50 = float(np.median(job_p50s))
+        med_job_p95 = float(np.median(job_p95s))
+        
+        summary_data[key] = {
+            "upload_p50": med_up_p50,
+            "upload_p95": med_up_p95,
+            "tp_med": med_tp,
+            "job_p50": med_job_p50
         }
-    else:
-        # Group by (condition, file_mb, vus)
-        grouped = {}
-        for t in trials:
-            key = (t["condition"], t["file_mb"], t["vus"])
-            grouped.setdefault(key, []).append(t)
-            
-        summary_data = {}
-        summary_csv_rows = []
-        for key, rows in grouped.items():
-            cond, mb, vus = key
-            up_p50s = [r["upload_p50_ms"] for r in rows]
-            up_p95s = [r["upload_p95_ms"] for r in rows]
-            tps = [r["throughput_jobs_per_min"] for r in rows]
-            job_p50s = [r["job_p50_sec"] for r in rows]
-            
-            med_up_p50 = float(np.median(up_p50s))
-            med_up_p95 = float(np.median(up_p95s))
-            med_tp = float(np.median(tps))
-            med_job_p50 = float(np.median(job_p50s))
-            
-            summary_data[key] = {
-                "upload_p50": med_up_p50,
-                "upload_p95": med_up_p95,
-                "tp_med": med_tp,
-                "job_p50": med_job_p50
-            }
-            summary_csv_rows.append({
-                "condition": cond,
-                "file_mb": mb,
-                "vus": vus,
-                "runs": len(rows),
-                "upload_p50_ms_median": med_up_p50,
-                "upload_p50_ms_min": min(up_p50s),
-                "upload_p50_ms_max": max(up_p50s),
-                "upload_p95_ms_median": med_up_p95,
-                "job_p50_sec_median": med_job_p50,
-                "throughput_jobs_min_median": med_tp,
-                "throughput_jobs_min_min": min(tps),
-                "throughput_jobs_min_max": max(tps),
-            })
-            
-        summary_csv_path = os.path.join(RESULTS_DIR, "benchmark_summary.csv")
-        with open(summary_csv_path, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=list(summary_csv_rows[0].keys()))
-            writer.writeheader()
-            writer.writerows(summary_csv_rows)
-        print(f"[SUMMARY] Wrote aggregated metrics to: {summary_csv_path}")
+        summary_csv_rows.append({
+            "condition": cond,
+            "file_mb": mb,
+            "vus": vus,
+            "runs": len(rows),
+            "upload_p50_ms_median": round(med_up_p50, 2),
+            "upload_p50_ms_min": round(min(up_p50s), 2),
+            "upload_p50_ms_max": round(max(up_p50s), 2),
+            "upload_p95_ms_median": round(med_up_p95, 2),
+            "job_p50_sec_median": round(med_job_p50, 3),
+            "job_p95_sec_median": round(med_job_p95, 3),
+            "throughput_jobs_min_median": round(med_tp, 1),
+            "throughput_jobs_min_min": round(min(tps), 1),
+            "throughput_jobs_min_max": round(max(tps), 1),
+            "failed_jobs_total": failed_sum,
+            "pod_restarts_max": max(restarts),
+            "oom_killed_max": max(ooms),
+            "min_vm_free_mb": min(free_mbs)
+        })
+        
+    summary_csv_path = os.path.join(RESULTS_DIR, "benchmark_summary.csv")
+    docs_summary_path = os.path.join(os.path.abspath("docs"), "benchmark_summary.csv")
+    os.makedirs(os.path.abspath("docs"), exist_ok=True)
+    
+    with open(summary_csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(summary_csv_rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(summary_csv_rows)
+    print(f"[SUMMARY] Wrote aggregated metrics to: {summary_csv_path}")
+
+    with open(docs_summary_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(summary_csv_rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(summary_csv_rows)
+    print(f"[SUMMARY] Wrote summary to docs: {docs_summary_path}")
 
     generate_charts(summary_data)
 

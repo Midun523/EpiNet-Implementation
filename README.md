@@ -530,14 +530,14 @@ Conditions A1 and A2 are the same configuration (1.5 GB backend, 256M redo) yet 
 5. **Horizontal Pod Autoscaling (HPA) & VM Memory Sizing:**
    Metrics-server deployed with `--kubelet-insecure-tls` to scrape kindlet nodes. HPAs target 60% CPU utilization:
    - **ML Service (`maxReplicas: 3`)**: Aligned strictly with the 3 partitions of topic `analysis.requested`. Additional replicas beyond 3 would remain permanently idle in the Kafka consumer group.
-   - **Backend (`maxReplicas: 1`)**: Pinned to 1 replica to strictly guarantee memory safety in the 7.57 GiB Docker VM:
-     * Compose Infrastructure: MySQL 8 (~1.05 GiB) + Kafka 3.8 (~820 MiB) = ~1.87 GiB
-     * K8s Control Plane & Metrics-Server: ~750 MiB
-     * Infrastructure Subtotal: ~2.62 GiB (leaving ~4.95 GiB for application workloads)
-     * ML Service Max Allocation: 3 replicas × 1.0 GiB limit = 3.0 GiB
-     * Frontend Max Allocation: 1 replica × 128 MiB limit = 0.128 GiB
-     * Backend Allocation: 1 replica × 2.0 GiB limit = 2.0 GiB
-     * Worst-Case Total Allocation: 2.62 + 3.0 + 0.128 + 2.0 = ~7.75 GiB (fits physical 7.57 GiB RAM with negligible burst into 2.0 GiB swap). If backend scaled to 2 replicas (4.0 GiB), peak limits would reach 9.75 GiB, risking host VM OOM crashes.
+   - **Backend (`maxReplicas: 1`)**: Pinned to 1 replica to strictly manage memory in the 7.57 GiB (7,751 MiB) Docker VM:
+     * Compose Infrastructure: MySQL 8 (~512–780 MiB) + Kafka 3.8 (~512–820 MiB) = ~1.3–1.6 GiB
+     * K8s Control Plane & Metrics-Server: ~600–750 MiB
+     * Backend: 1 replica × 2.0 GiB limit (2,048 MiB)
+     * Frontend: 1 replica × 128 MiB limit
+     * ML Service: 1 replica base (1,024 MiB limit) up to 3 replicas (3,072 MiB limit)
+     * Testing & Observability (when active): k6 container (~256 MiB), Prometheus (~256 MiB), Grafana (~128 MiB), Exporter (~64 MiB) = ~704 MiB
+     * **Memory Headroom & Risk**: With 1 ML replica, baseline allocation sums to ~5,528 MiB (~1,700–2,200 MiB free headroom). Under full HPA scale-out to 3 ML replicas plus k6 execution, total allocation reaches ~7,128 MiB, leaving ~623 MiB headroom against the 7,751 MiB physical VM ceiling. While safe under ordinary steady-state operation, simultaneous burst concurrency approaches physical limits and relies on WSL2 2.0 GiB swap. Consequently, memory headroom is constrained and requires active monitoring—there is no "zero risk" under unconstrained load.
 6. **Secrets & Manifest Management:**
    `k8s/secret.template.yaml`, `k8s/backend-deployment.template.yaml`, and `k8s/ml-service-deployment.template.yaml` are committed as reference templates. Real credentials from `.env` and the dynamic kind gateway IP are templated via `python k8s/generate-secrets.py` on deployment. Generated files containing local secrets (`secret.yaml`) are strictly ignored by git (`.gitignore`).
 
@@ -620,38 +620,38 @@ Under single-replica execution (HPAs removed, 1 replica pinned):
 
 Performance and architectural comparisons were evaluated under controlled load using `k6` in Docker (`grafana/k6`), synthetic pharmacogenomics datasets, and a kind cluster running on Docker Desktop / WSL2.
 
-Raw per-request latencies, per-job database records, and system timeseries are preserved in the git-ignored `results/` directory (`results/*_k6_raw.csv`, `results/*_jobs.csv`, `results/*_system.csv`, and `results/benchmark_summary.csv`).
+Raw per-request latencies, per-job database records, and system timeseries are preserved in the git-ignored `results/` directory (`results/*_k6_raw.csv`, `results/*_jobs.csv`, `results/*_system.csv`). The aggregated summary metrics are committed directly to [`docs/benchmark_summary.csv`](docs/benchmark_summary.csv).
 
 ### Test Conditions & Workloads
-- **State Reset**: MySQL storage volume purged (`down -v`), pods recreated, and queues drained before each test condition.
-- **Interleaving**: ABBA sequence order across load levels to cancel systematic warm-up or thermal drift.
+- **State Reset**: MySQL storage volume purged (`down -v`), fresh Kafka topics created, pods recreated, and queues drained before each test condition.
+- **Interleaving**: 3 repetitions executed in ABBA sequence order across conditions (`sync -> kafka_fixed1 -> kafka_hpa`, `kafka_hpa -> kafka_fixed1 -> sync`, `sync -> kafka_fixed1 -> kafka_hpa`) to cancel systematic warm-up or host thermal drift (54 total runs).
 - **Comparisons**:
   1. *Architecture*: Synchronous REST Path (`ANALYSIS_MODE=sync`) vs Event-Driven Kafka Path (`ANALYSIS_MODE=kafka`, 1 ML replica).
   2. *Elasticity*: Fixed Single ML Replica vs Horizontal Pod Autoscaler (`HPA 1-3`, CPU target 60%).
-- **Load Steps**: 2 MB CSV (1, 2, 4, 8 concurrent VUs) and 10 MB CSV (1, 2 concurrent VUs) for 60 seconds each.
+- **Load Steps**: 2 MB CSV (1, 2, 4, 8 concurrent VUs) and 10 MB CSV (1, 2 concurrent VUs) for 30 seconds each.
 
 ### 1. Ingestion Latency Decoupling (Sync vs Kafka)
-![Upload Response Time vs Load](results/chart1_response_time_vs_load.png)
+![Upload Response Time vs Load](docs/images/chart1_response_time_vs_load.png)
 *Caption: Single laptop, Docker Desktop/WSL2, kind, synthetic data, N runs, medians with min-max.*
 
-In the synchronous path, client HTTP connection duration is coupled directly to backend thread pool availability and ML compute execution. At 8 concurrent clients, upload p50 latency climbs past 5,100 ms (p95 > 7,400 ms), with task rejections occurring as `analysisExecutor` exhausts its bounded queue. In the Kafka-backed architecture, the backend accepts the payload, persists the raw bytes, publishes the analysis event, and responds in **125–168 ms (p50)** regardless of downstream concurrency.
+In the synchronous path, client HTTP connection duration is tied directly to backend thread pool availability and ML compute execution. Under concurrency (4 to 8 VUs), upload p50 latency on 2 MB files spikes to **3,256–3,911 ms (p95 up to 30,927 ms)**. Crucially, as `@Async("analysisExecutor")` exhausted its queue capacity (15 tasks), the sync path threw task rejections and dropped requests, accumulating **316 failed/rejected jobs** across the test suite. In the Kafka-backed architecture, the backend accepts the payload, persists the entity, publishes the analysis event, and responds with HTTP 202 in **90.9–468.4 ms (p50)**, absorbing load with **0 dropped requests**.
 
 ### 2. Throughput & Autoscaling Elasticity
-![Throughput vs Load](results/chart2_throughput_vs_load.png)
+![Throughput vs Load](docs/images/chart2_throughput_vs_load.png)
 *Caption: Single laptop, Docker Desktop/WSL2, kind, synthetic data, N runs, medians with min-max.*
 
-- **Sync Path**: Capped at ~94–96 jobs/min due to Tomcat and Spring `@Async` executor queue constraints.
-- **Kafka Path (Fixed 1 Replica)**: Reaches steady ~118 jobs/min with 0 dropped requests; excess load buffers safely in the Kafka topic.
-- **Kafka Path + HPA (1–3 Replicas)**: As CPU utilization surpasses 60%, the Kubernetes Horizontal Pod Autoscaler scales the ML deployment to 3 pods, increasing throughput to **~265 jobs/min (a 2.25x scaling factor)**.
+- **Sync Path**: Ingestion throughput degrades sharply under concurrency due to bounded thread pool rejections (HTTP 503).
+- **Kafka Path (Fixed 1 Replica)**: Provides smooth buffering with 0 dropped jobs; throughput steadily queues and processes through the partition without task rejection.
+- **Kafka Path + HPA (1–3 Replicas)**: Automatically detects CPU utilization crossing the 60% threshold via metrics-server, scaling out ready ML replicas to clear burst queues.
 
 ### 3. Horizontal Pod Autoscaler Dynamics
-![Replicas Over Time Under Load](results/chart3_replicas_over_time.png)
+![Replicas Over Time Under Load](docs/images/chart3_replicas_over_time.png)
 *Caption: Single laptop, Docker Desktop/WSL2, kind, synthetic data, N runs, medians with min-max.*
 
-Under sustained 8-client upload load, HPA monitors container CPU metrics via metrics-server, progressively scaling ML pods from 1 to 2 at ~20s, and to 3 at ~50s, stabilizing queue depth.
+Plotted directly from the high-frequency system monitor timeseries (`results/*_system.csv`): under sustained load, HPA monitors container CPU metrics, scaling ML pods dynamically to balance partition consumer lag while maintaining single-pod allocation during lower load.
 
 ### 4. Single-Clock Pod Recovery Timeline
-![Recovery Timeline](results/chart4_recovery_timeline.png)
+![Recovery Timeline](docs/images/chart4_recovery_timeline.png)
 *Caption: Single laptop, Docker Desktop/WSL2, kind, synthetic data, N runs, medians with min-max.*
 
 Timeline from forced pod deletion (`kubectl delete pod` mid-computation):
@@ -661,6 +661,9 @@ Timeline from forced pod deletion (`kubectl delete pod` mid-computation):
 - `T+11.45s`: HTTP `/health` readiness probe passes (`initialDelaySeconds: 10`).
 - `T+12.10s`: Consumer resumes uncommitted partition offset and runs OLS regression.
 - `T+13.12s`: Result published to `analysis.completed`, status updated to `COMPLETED`.
+
+### Baseline Comparison Note
+- **Docker Compose Baseline**: Tested on the exact 40.00 MB / 41,942,992-byte dataset (377,864 rows), ML compute duration is **3.79 s median** (3.51s–4.79s across runs) when thread-constrained (`OMP_NUM_THREADS=1`). The earlier ~13.8 s duration reflected CFS thread contention prior to setting `OMP_NUM_THREADS=1`.
 
 ### What Was NOT Established
 - **Multi-Node Cluster Scheduling**: Tests ran on a single physical host inside a single kind node. Inter-node network hops, cross-availability-zone latency, and distributed volume attachments were not evaluated.

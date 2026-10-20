@@ -85,6 +85,8 @@ KAFKA_ENABLED = os.getenv("KAFKA_ENABLED", "true").lower() == "true"
 # WHY: Maximum time window to retry transient backend errors before giving up,
 # publishing FAILED, and committing the Kafka offset to unblock the partition.
 TRANSIENT_RETRY_TIMEOUT_SECONDS = float(os.getenv("TRANSIENT_RETRY_TIMEOUT_SECONDS", "600"))
+# DEMO-ONLY: Optional synthetic delay during compute to demonstrate in-flight pod failure recovery. Default 0.
+DEMO_COMPUTE_DELAY_SECONDS = float(os.getenv("DEMO_COMPUTE_DELAY_SECONDS", "0"))
 
 # The 10 pharmacogenomic genes this service expects
 EXPECTED_GENES = [
@@ -219,6 +221,9 @@ def _run_full_analysis(content: bytes, analysis_id: Optional[str] = None) -> dic
     gene_df, phenotype, rows_processed = _validate_and_load(content)
 
     logger.info("Analyzing %d rows", rows_processed)
+    if DEMO_COMPUTE_DELAY_SECONDS > 0:
+        logger.info("[DEMO-ONLY] Injecting %.1fs compute delay for pod-kill demo...", DEMO_COMPUTE_DELAY_SECONDS)
+        time.sleep(DEMO_COMPUTE_DELAY_SECONDS)
     matrix = _compute_interaction_matrix(gene_df, phenotype)
 
     # Build top pairs list
@@ -289,6 +294,12 @@ def _fetch_csv_from_backend(
         except Exception as e:
             last_error = e
             elapsed = time.time() - t0
+            # If backend explicitly returns 404 Not Found, allow 3 attempts (for eventual consistency / upload race)
+            # but do not loop for 10 minutes retrying non-existent database records.
+            if isinstance(e, urllib.error.HTTPError) and e.code == 404 and attempt >= 3:
+                logger.error("Job %s not found on backend (HTTP 404 after %d attempts). Record does not exist.", analysis_id, attempt)
+                raise ValueError(f"Analysis {analysis_id} not found on backend (HTTP 404)")
+
             if attempt < max_attempts and elapsed < TRANSIENT_RETRY_TIMEOUT_SECONDS:
                 sleep_sec = backoffs[attempt - 1] if attempt - 1 < len(backoffs) else backoffs[-1]
                 logger.warning(

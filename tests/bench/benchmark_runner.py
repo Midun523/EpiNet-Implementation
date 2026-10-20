@@ -84,6 +84,12 @@ def reset_state():
     run_cmd(["docker", "compose", "rm", "-v", "-f", "mysql"])
     run_cmd(["docker", "compose", "up", "-d", "mysql"])
 
+    # Recreate Kafka topics to prevent stale ghost messages across resets
+    run_cmd(["docker", "compose", "exec", "-T", "kafka", "/opt/kafka/bin/kafka-topics.sh", "--bootstrap-server", "localhost:9092", "--delete", "--topic", "analysis.requested", "--if-exists"])
+    run_cmd(["docker", "compose", "exec", "-T", "kafka", "/opt/kafka/bin/kafka-topics.sh", "--bootstrap-server", "localhost:9092", "--create", "--topic", "analysis.requested", "--partitions", "3", "--replication-factor", "1", "--if-not-exists"])
+    run_cmd(["docker", "compose", "exec", "-T", "kafka", "/opt/kafka/bin/kafka-topics.sh", "--bootstrap-server", "localhost:9092", "--delete", "--topic", "analysis.completed", "--if-exists"])
+    run_cmd(["docker", "compose", "exec", "-T", "kafka", "/opt/kafka/bin/kafka-topics.sh", "--bootstrap-server", "localhost:9092", "--create", "--topic", "analysis.completed", "--partitions", "3", "--replication-factor", "1", "--if-not-exists"])
+
     # Wait for MySQL ping
     for _ in range(30):
         out, _, code = run_cmd(["docker", "compose", "exec", "-T", "mysql", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot_pass"])
@@ -95,7 +101,7 @@ def reset_state():
     run_cmd(["kubectl", "rollout", "restart", "deployment", "backend", "ml-service"])
     run_cmd(["kubectl", "rollout", "status", "deployment", "backend", "--timeout=90s"])
     run_cmd(["kubectl", "rollout", "status", "deployment", "ml-service", "--timeout=90s"])
-    print("[STATE RESET] Cluster pods and clean database ready.")
+    print("[STATE RESET] Cluster pods, clean database, and fresh Kafka topics ready.")
 
 
 def configure_condition(condition_name: str):
@@ -189,13 +195,16 @@ class SystemMonitor(threading.Thread):
             writer.writerows(self.records)
 
 
-def extract_database_jobs(t_start_iso: str, t_end_iso: str, out_path: str):
-    """Extracts job records from MySQL created between t_start and t_end."""
-    sql = f"""
+def truncate_db():
+    run_cmd(["docker", "compose", "exec", "-T", "mysql", "mysql", "-uroot", "-proot_pass", "-e", "TRUNCATE TABLE epinet.analysis_run;"])
+
+
+def extract_database_jobs(out_path: str):
+    """Extracts job records from MySQL for the current trial."""
+    sql = """
     SELECT id, status, created_at, completed_at, 
            TIMESTAMPDIFF(MICROSECOND, created_at, completed_at)/1000000.0 AS duration_sec
     FROM epinet.analysis_run 
-    WHERE created_at >= '{t_start_iso}'
     ORDER BY created_at ASC;
     """
     cmd = ["docker", "compose", "exec", "-T", "mysql", "mysql", "-uroot", "-proot_pass", "-e", sql]
@@ -261,11 +270,12 @@ def run_benchmark_trial(condition: str, file_mb: int, vus: int, rep: int, durati
     run_id = f"{condition}_{file_mb}mb_{vus}vu_rep{rep}_{int(time.time())}"
     print(f"\n{'='*70}\nTRIAL START: Condition={condition} | File={file_mb}MB | VUs={vus} | Rep={rep}\n{'='*70}")
 
+    # Ensure clean database before run
+    truncate_db()
+
     # Start system monitor
     monitor = SystemMonitor(run_id=run_id, interval_sec=2.0)
     monitor.start()
-
-    t_start_iso = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
     # Run k6
     csv_filename = f"benchmark_{file_mb}mb.csv"
@@ -274,8 +284,6 @@ def run_benchmark_trial(condition: str, file_mb: int, vus: int, rep: int, durati
     # Wait for completion of any queued tasks
     wait_for_jobs_drain()
 
-    t_end_iso = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-
     # Stop monitor and save
     monitor.stop()
     sys_out = os.path.join(RESULTS_DIR, f"{run_id}_system.csv")
@@ -283,7 +291,7 @@ def run_benchmark_trial(condition: str, file_mb: int, vus: int, rep: int, durati
 
     # Extract database jobs
     jobs_out = os.path.join(RESULTS_DIR, f"{run_id}_jobs.csv")
-    job_count = extract_database_jobs(t_start_iso, t_end_iso, jobs_out)
+    job_count = extract_database_jobs(jobs_out)
     print(f"[TRIAL COMPLETE] Saved {job_count} job records -> {jobs_out}")
     print(f"[TRIAL COMPLETE] Saved system timeseries -> {sys_out}")
 
@@ -300,7 +308,7 @@ def run_benchmark_trial(condition: str, file_mb: int, vus: int, rep: int, durati
 def main():
     parser = argparse.ArgumentParser(description="EpiNet Benchmark Suite")
     parser.add_argument("--duration", type=int, default=60, help="Duration in seconds per load step (default: 60)")
-    parser.add_argument("--repetitions", type=int, default=5, help="Repetitions per condition (default: 5)")
+    parser.add_argument("--repetitions", type=int, default=3, help="Repetitions per condition (default: 3)")
     parser.add_argument("--comparison", choices=["sync_vs_kafka", "fixed_vs_hpa", "all"], default="all")
     parser.add_argument("--quick", action="store_true", help="Quick verification mode (shorter duration for dry-run)")
     args = parser.parse_args()
@@ -323,52 +331,54 @@ def main():
         (10, 2),
     ]
 
-    # Comparisons to run
-    comparisons = []
-    if args.comparison in ("sync_vs_kafka", "all"):
-        comparisons.append(("sync", "kafka_fixed1"))
-    if args.comparison in ("fixed_vs_hpa", "all"):
-        comparisons.append(("kafka_fixed1", "kafka_hpa"))
+    if args.comparison == "sync_vs_kafka":
+        conditions = ["sync", "kafka_fixed1"]
+    elif args.comparison == "fixed_vs_hpa":
+        conditions = ["kafka_fixed1", "kafka_hpa"]
+    else:
+        conditions = ["sync", "kafka_fixed1", "kafka_hpa"]
+    
+    total_runs = len(load_levels) * len(conditions) * reps
+    expected_duration_sec = total_runs * (duration + 5) + (len(conditions) * reps * 20)
+
+    print("=" * 72)
+    print(f"EPINET PHASE 5 BENCHMARK SUITE")
+    print(f"  Duration per run:        {duration}s")
+    print(f"  Repetitions:             {reps}")
+    print(f"  Conditions:              {conditions}")
+    print(f"  Load Levels:             {len(load_levels)} levels: {load_levels}")
+    print(f"  Total Matrix Runs:       {total_runs} runs")
+    print(f"  Expected Total Duration: {expected_duration_sec}s (~{expected_duration_sec / 60.0:.1f} minutes)")
+    print("=" * 72)
 
     trial_log = os.path.join(RESULTS_DIR, f"bench_manifest_{int(time.time())}.json")
     all_trials = []
 
-    print("=" * 72)
-    print(f"EPINET PHASE 5 BENCHMARK SUITE STARTING")
-    print(f"  Duration per run: {duration}s")
-    print(f"  Repetitions:      {reps}")
-    print(f"  Comparisons:      {comparisons}")
-    print(f"  Load Levels:      {load_levels}")
-    print("=" * 72)
+    # Execute matrix in ABBA order across repetitions:
+    # Rep 0 (odd 1): A -> B -> C
+    # Rep 1 (even 2): C -> B -> A
+    # Rep 2 (odd 3): A -> B -> C
+    for rep_idx in range(reps):
+        if rep_idx % 2 == 0:
+            cond_order = list(conditions)
+        else:
+            cond_order = list(reversed(conditions))
 
-    for cond_a, cond_b in comparisons:
-        print(f"\n######################################################################")
-        print(f"COMMENCING COMPARISON: {cond_a} vs {cond_b} in ABBA INTERLEAVING")
-        print(f"######################################################################")
+        print(f"\n{'#'*72}")
+        print(f">>> COMMENCING REPETITION {rep_idx + 1} OF {reps} (ORDER: {' -> '.join(cond_order)}) <<<")
+        print(f"{'#'*72}")
 
-        # Build ABBA sequence of pairs for each load level:
-        # Rep 1: A, B
-        # Rep 2: B, A
-        # Rep 3: A, B
-        # Rep 4: B, A
-        # Rep 5: A, B
-        for file_mb, vus in load_levels:
-            print(f"\n>>> LOAD LEVEL: {file_mb} MB CSV @ {vus} VUs <<<")
-            for rep_idx in range(reps):
-                # Interleaved ABBA order
-                if rep_idx % 2 == 0:
-                    pair_order = [(cond_a, rep_idx + 1), (cond_b, rep_idx + 1)]
-                else:
-                    pair_order = [(cond_b, rep_idx + 1), (cond_a, rep_idx + 1)]
+        for c_name in cond_order:
+            print(f"\n>>> STATE RESET AND SETUP FOR CONDITION: {c_name} (Rep {rep_idx + 1}) <<<")
+            reset_state()
+            configure_condition(c_name)
 
-                for c_name, r_num in pair_order:
-                    reset_state()
-                    configure_condition(c_name)
-                    t_info = run_benchmark_trial(c_name, file_mb, vus, r_num, duration)
-                    all_trials.append(t_info)
+            for file_mb, vus in load_levels:
+                t_info = run_benchmark_trial(c_name, file_mb, vus, rep_idx + 1, duration)
+                all_trials.append(t_info)
 
-                    with open(trial_log, "w") as f:
-                        json.dump(all_trials, f, indent=2)
+                with open(trial_log, "w") as f:
+                    json.dump(all_trials, f, indent=2)
 
     print("\n" + "=" * 72)
     print(f"ALL BENCHMARK TRIALS COMPLETED! ({len(all_trials)} total runs)")

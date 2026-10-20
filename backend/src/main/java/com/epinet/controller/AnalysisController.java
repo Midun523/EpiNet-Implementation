@@ -123,10 +123,19 @@ public class AnalysisController {
             repo.saveAndFlush(run);
 
             log.info("Sync path: saved UPLOADED job {}, firing async HTTP call", analysisId);
-            analysisService.runAnalysis(analysisId, bytes, file.getOriginalFilename());
-
-            return ResponseEntity.status(HttpStatus.ACCEPTED)
-                    .body(Map.of("analysisId", analysisId, "status", "PROCESSING"));
+            try {
+                analysisService.runAnalysis(analysisId, bytes, file.getOriginalFilename());
+                return ResponseEntity.status(HttpStatus.ACCEPTED)
+                        .body(Map.of("analysisId", analysisId, "status", "PROCESSING"));
+            } catch (Exception ex) {
+                log.warn("Sync path executor saturated/rejected job {}: {}", analysisId, ex.getMessage());
+                run.setStatus(AnalysisRun.Status.FAILED);
+                run.setCompletedAt(java.time.LocalDateTime.now());
+                run.setErrorMessage("Task rejected: server thread pool capacity exceeded (" + ex.getClass().getSimpleName() + ")");
+                repo.save(run);
+                return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+                        .body(Map.of("analysisId", analysisId, "status", "FAILED", "error", run.getErrorMessage()));
+            }
         }
     }
 
