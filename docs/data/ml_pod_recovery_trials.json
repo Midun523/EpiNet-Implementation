@@ -1,0 +1,181 @@
+[
+  {
+    "trial": 1,
+    "initial_pod": "ml-service-8589b75f8-lhxdl",
+    "replacement_pod": "ml-service-8589b75f8-hm922",
+    "t_kill": "2026-10-20T07:57:25.035763+00:00",
+    "t_pod_created": "2026-10-20T07:57:25+00:00",
+    "t_container_started": "2026-10-20T07:57:26+00:00",
+    "t_pod_ready": "2026-10-20T07:57:38+00:00",
+    "t_terminal": "2026-10-20T07:57:28.059984+00:00",
+    "terminal_status": "COMPLETED",
+    "dur_terminal_from_upload": 9.596644,
+    "dur_terminal_from_kill": 3.024221,
+    "dur_ready_from_kill": 12.964237,
+    "dur_terminal_from_ready": -9.940016,
+    "error_msg": null,
+    "timeline": [
+      {
+        "event": "upload_started",
+        "time": "2026-10-20T07:57:18.463340+00:00",
+        "details": "File size 35.00 MB"
+      },
+      {
+        "event": "upload_finished",
+        "time": "2026-10-20T07:57:21.769248+00:00",
+        "details": "analysisId=afbb24de-c467-47af-89fe-d7f15affa912, HTTP 202"
+      },
+      {
+        "event": "status_processing",
+        "time": "2026-10-20T07:57:25.035763+00:00",
+        "details": "Job status -> PROCESSING"
+      },
+      {
+        "event": "kill_issued",
+        "time": "2026-10-20T07:57:25.035763+00:00",
+        "details": "Deleting active ML pod ml-service-8589b75f8-lhxdl"
+      },
+      {
+        "event": "new_pod_created",
+        "time": "2026-10-20T07:57:25+00:00",
+        "details": "Pod ml-service-8589b75f8-hm922 created"
+      },
+      {
+        "event": "container_started",
+        "time": "2026-10-20T07:57:26+00:00",
+        "details": "Container started in ml-service-8589b75f8-hm922"
+      },
+      {
+        "event": "status_completed",
+        "time": "2026-10-20T07:57:28.059984+00:00",
+        "details": "Job status -> COMPLETED"
+      },
+      {
+        "event": "pod_ready",
+        "time": "2026-10-20T07:57:38+00:00",
+        "details": "Pod ml-service-8589b75f8-hm922 Ready=True condition met"
+      }
+    ]
+  },
+  {
+    "trial": 2,
+    "initial_pod": "ml-service-8589b75f8-hm922",
+    "replacement_pod": "ml-service-8589b75f8-qb4gm",
+    "t_kill": "2026-10-20T07:58:33.482189+00:00",
+    "t_pod_created": "2026-10-20T07:58:34+00:00",
+    "t_container_started": "2026-10-20T07:58:45+00:00",
+    "t_pod_ready": "2026-10-20T07:59:07+00:00",
+    "t_terminal": "2026-10-20T07:59:07.302515+00:00",
+    "terminal_status": "COMPLETED",
+    "dur_terminal_from_upload": 69.216768,
+    "dur_terminal_from_kill": 33.820326,
+    "dur_ready_from_kill": 33.517811,
+    "dur_terminal_from_ready": 0.302515,
+    "error_msg": null,
+    "timeline": [
+      {
+        "event": "upload_started",
+        "time": "2026-10-20T07:57:58.085747+00:00",
+        "details": "File size 35.00 MB"
+      },
+      {
+        "event": "upload_finished",
+        "time": "2026-10-20T07:58:25.127698+00:00",
+        "details": "analysisId=a2b5651b-d797-4438-8691-5f1e9bdcddbf, HTTP 202"
+      },
+      {
+        "event": "status_pending",
+        "time": "2026-10-20T07:58:30.614877+00:00",
+        "details": "Job status -> PENDING"
+      },
+      {
+        "event": "status_processing",
+        "time": "2026-10-20T07:58:33.482189+00:00",
+        "details": "Job status -> PROCESSING"
+      },
+      {
+        "event": "kill_issued",
+        "time": "2026-10-20T07:58:33.482189+00:00",
+        "details": "Deleting active ML pod ml-service-8589b75f8-hm922"
+      },
+      {
+        "event": "new_pod_created",
+        "time": "2026-10-20T07:58:34+00:00",
+        "details": "Pod ml-service-8589b75f8-qb4gm created"
+      },
+      {
+        "event": "container_started",
+        "time": "2026-10-20T07:58:45+00:00",
+        "details": "Container started in ml-service-8589b75f8-qb4gm"
+      },
+      {
+        "event": "status_completed",
+        "time": "2026-10-20T07:59:07.302515+00:00",
+        "details": "Job status -> COMPLETED"
+      },
+      {
+        "event": "pod_ready",
+        "time": "2026-10-20T07:59:07+00:00",
+        "details": "Pod ml-service-8589b75f8-qb4gm Ready=True condition met"
+      }
+    ]
+  },
+  {
+    "trial": 3,
+    "initial_pod": "ml-service-8589b75f8-qb4gm",
+    "replacement_pod": "ml-service-8589b75f8-b9z7m",
+    "t_kill": "2026-10-20T07:59:29.259888+00:00",
+    "t_pod_created": "2026-10-20T07:59:29+00:00",
+    "t_container_started": "2026-10-20T07:59:29+00:00",
+    "t_pod_ready": "2026-10-20T07:59:41+00:00",
+    "t_terminal": "2026-10-20T07:59:34.449049+00:00",
+    "terminal_status": "COMPLETED",
+    "dur_terminal_from_upload": 17.449947,
+    "dur_terminal_from_kill": 5.189161,
+    "dur_ready_from_kill": 11.740112,
+    "dur_terminal_from_ready": -6.550951,
+    "error_msg": null,
+    "timeline": [
+      {
+        "event": "upload_started",
+        "time": "2026-10-20T07:59:16.999102+00:00",
+        "details": "File size 35.00 MB"
+      },
+      {
+        "event": "upload_finished",
+        "time": "2026-10-20T07:59:27.063785+00:00",
+        "details": "analysisId=d515a78f-af6b-4b86-bc90-8d756491931b, HTTP 202"
+      },
+      {
+        "event": "status_processing",
+        "time": "2026-10-20T07:59:29.259888+00:00",
+        "details": "Job status -> PROCESSING"
+      },
+      {
+        "event": "kill_issued",
+        "time": "2026-10-20T07:59:29.259888+00:00",
+        "details": "Deleting active ML pod ml-service-8589b75f8-qb4gm"
+      },
+      {
+        "event": "new_pod_created",
+        "time": "2026-10-20T07:59:29+00:00",
+        "details": "Pod ml-service-8589b75f8-b9z7m created"
+      },
+      {
+        "event": "container_started",
+        "time": "2026-10-20T07:59:29+00:00",
+        "details": "Container started in ml-service-8589b75f8-b9z7m"
+      },
+      {
+        "event": "status_completed",
+        "time": "2026-10-20T07:59:34.449049+00:00",
+        "details": "Job status -> COMPLETED"
+      },
+      {
+        "event": "pod_ready",
+        "time": "2026-10-20T07:59:41+00:00",
+        "details": "Pod ml-service-8589b75f8-b9z7m Ready=True condition met"
+      }
+    ]
+  }
+]

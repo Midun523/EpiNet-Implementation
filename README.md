@@ -623,29 +623,84 @@ Under single-replica execution (HPAs removed, 1 replica pinned):
 
 Performance and architectural comparisons were evaluated under controlled load using `k6` in Docker (`grafana/k6`), synthetic pharmacogenomics datasets, and a kind cluster running on Docker Desktop / WSL2.
 
-Raw per-request latencies, per-job database records, and system timeseries are preserved in the git-ignored `results/` directory (`results/*_k6_raw.csv`, `results/*_jobs.csv`, `results/*_system.csv`). The aggregated summary metrics are committed directly to [`docs/benchmark_summary.csv`](docs/benchmark_summary.csv).
+Raw per-request latencies, per-job database records, and system timeseries are preserved in the git-ignored `results/` directory (`results/*_k6_raw.csv`, `results/*_jobs.csv`, `results/*_system.csv`). The complete aggregated summary metrics are committed to [`docs/benchmark_summary.csv`](docs/benchmark_summary.csv), and a compressed raw bundle is available at [`docs/data/raw_benchmark_results.zip`](docs/data/raw_benchmark_results.zip).
+
+### Suite Wall Time & Operational Breakdown
+- **Full Closed-Loop Suite Wall Time**: Measured directly from first cell start timestamp (`1792477774` / 07:49:34 UTC) to last cell completion timestamp (`1792482426` / 09:07:06 UTC), the total wall clock execution was **4,652.13 seconds (77.54 minutes)**.
+  - **Sum of 54 Cell Execution Times**: **3,844.40 seconds (64.07 minutes)**.
+  - **Inter-Condition State Reset Overhead**: **807.73 seconds (13.47 minutes)** across 9 condition transitions (~89.7 s per reset for MySQL volume wipe `down -v`, Kafka topic recreation, rollout verification, and probe stabilization).
+  - *Correction Note*: The earlier ~49.8 minute figure was a pre-run theoretical estimate ($54 \times \sim 55\text{ s}$) that failed to incorporate queue drain wait times and inter-condition infrastructure tear-downs.
+- **HPA Independent Re-Run Suite**: Resetting `ml-service` to 1 replica before every cell and draining to completion took **1,859.67 seconds (30.99 minutes)** (expected: ~16.5 min).
+- **Open-Loop Suite**: 12 runs with constant arrival rate took **568.28 seconds (9.47 minutes)** (expected: ~11.0 min).
 
 ### Test Conditions & Workloads
 - **State Reset**: Clean state before each condition: MySQL storage volume purged (`down -v`), fresh Kafka topics created (`analysis.requested` and `analysis.completed` with 3 partitions), pods restarted, and queues drained before each test condition.
-- **Interleaving**: 3 repetitions executed in ABBA sequence order across conditions (`sync -> kafka_fixed1 -> kafka_hpa`, `kafka_hpa -> kafka_fixed1 -> sync`, `sync -> kafka_fixed1 -> kafka_hpa`) to cancel systematic warm-up or host thermal drift (54 total runs, 20s per cell).
+- **Interleaving**: 3 repetitions executed in ABBA sequence order across conditions (`sync -> kafka_fixed1 -> kafka_hpa`, `kafka_hpa -> kafka_fixed1 -> sync`, `sync -> kafka_fixed1 -> kafka_hpa`) to cancel systematic warm-up or host thermal drift.
 - **Comparisons**:
   1. *Architecture*: Synchronous REST Path (`ANALYSIS_MODE=sync`) vs Event-Driven Kafka Path (`ANALYSIS_MODE=kafka`, 1 ML replica).
   2. *Elasticity*: Fixed Single ML Replica vs Horizontal Pod Autoscaler (`HPA 1-3`, CPU target 60%).
-- **Load Steps**: 2 MB CSV (1, 2, 4, 8 concurrent VUs) and 10 MB CSV (1, 2 concurrent VUs) for 20 seconds each.
+  3. *Load Realism*: Closed-Loop Concurrency vs Open-Loop Constant Arrival Rate (20 and 60 arrivals/min).
+
+### Closed-Loop Load Realism & Backlog Note
+> [!NOTE]
+> In k6 closed-loop load tests, virtual users (VUs) submit requests back-to-back with zero think time. As a result, when the arrival rate exceeds single-worker processing capacity, Kafka message queues grow monotonically for the duration of the test. Under closed-loop saturation, the reported `job_p50_sec` primarily measures **queue backlog delay** rather than raw execution time. To measure steady-state execution independent of queue inflation, an open-loop condition with fixed arrival rates (20 and 60 jobs/min) was executed using the k6 `constant-arrival-rate` executor.
+
+### Metric Definitions & Censoring Standards
+- **Throughput (jobs / min)**: Formally defined as $\frac{\text{Total Completed Jobs}}{\Delta t_{\text{active}}} \times 60$, where $\Delta t_{\text{active}}$ is measured from the first job's `created_at` timestamp to the last job's `completed_at` timestamp. If 0 jobs completed, throughput is marked **N/A** (not `0.0`).
+- **No Data Censoring**: Any metric cell where no jobs completed is explicitly marked **N/A** to avoid misleading 0.0 values.
+- **Contradiction Resolution (`kafka_fixed1 2MB 4VU`)**: In earlier runs with a short 45s drain cap, Rep 1 completed 6 jobs during drain (p50: 66.3s, throughput: 5.0 jobs/min) while Reps 2 and 3 timed out with 0 completions. Taking the median across `[5.0, 0.0, 0.0]` previously produced "throughput 0.0", which contradicted the non-zero job p50. In the updated pipeline, all runs drain until the queue is empty (or 10-minute cap), and runs with 0 completions are censored to `N/A`.
+
+### Summary Benchmark Table
+The complete metrics across all conditions, file sizes, and load levels (medians across 3 repetitions):
+
+| Condition | File | Load Level | 202 Accepted | HTTP 503 | Completed (k6) | Completed (Drain) | Pending End | Failed | Drain Time (s) | Upload p50 (ms) | Upload p95 (ms) | Job p50 (s) | Job p95 (s) | Throughput (jobs/min) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| **sync** | 2 MB | 1 VU | 45 | 1 | 45 | 0 | 0 | 1 | 0.00 | 861.6 | 3,216.1 | 15.11 | 18.75 | 27.6 |
+| **sync** | 2 MB | 2 VU | 80 | 63 | 80 | 0 | 0 | 63 | 0.00 | 374.6 | 6,230.2 | 13.00 | 28.64 | 32.6 |
+| **sync** | 2 MB | 4 VU | 57 | 87 | 57 | 0 | 0 | 87 | 0.00 | 477.1 | 10,092.6 | 13.92 | 22.19 | 38.1 |
+| **sync** | 2 MB | 8 VU | 54 | 48 | 57 | 0 | 0 | 48 | 0.00 | 3,850.1 | 17,261.3 | 28.19 | 42.68 | 23.8 |
+| **sync** | 10 MB | 1 VU | 36 | 0 | 35 | 0 | 1 | 0 | 0.00 | 718.1 | 4,845.6 | 29.04 | 57.58 | 9.3 |
+| **sync** | 10 MB | 2 VU | 29 | 0 | 27 | 0 | 5 | 0 | 0.00 | 1,712.1 | 11,061.0 | 60.89 | 80.25 | 4.3 |
+| **kafka_fixed1** | 2 MB | 1 VU | 185 | 0 | 145 | 0 | 40 | 0 | 0.00 | 171.4 | 667.4 | 12.58 | 56.32 | 38.8 |
+| **kafka_fixed1** | 2 MB | 2 VU | 376 | 0 | 164 | 0 | 212 | 0 | 0.00 | 184.5 | 848.5 | 55.22 | 67.03 | 62.9 |
+| **kafka_fixed1** | 2 MB | 4 VU | 327 | 0 | 6 | 0 | 321 | 0 | 0.00 | 237.1 | 4,576.5 | 66.34 | 70.77 | 5.0 |
+| **kafka_fixed1** | 2 MB | 8 VU | 193 | 0 | 0 | 0 | 205 | 0 | 0.00 | 759.7 | 2,360.0 | N/A | N/A | N/A |
+| **kafka_fixed1** | 10 MB | 1 VU | 20 | 0 | 0 | 0 | 20 | 0 | 0.00 | 1,980.5 | 6,521.1 | N/A | N/A | N/A |
+| **kafka_fixed1** | 10 MB | 2 VU | 40 | 0 | 0 | 0 | 40 | 0 | 0.00 | 1,491.1 | 8,227.0 | N/A | N/A | N/A |
+| **kafka_hpa** | 2 MB | 1 VU | 392 | 0 | 377 | 0 | 15 | 0 | 0.00 | 151.5 | 1,348.0 | 14.83 | 32.91 | 77.2 |
+| **kafka_hpa** | 2 MB | 2 VU | 669 | 0 | 658 | 0 | 11 | 0 | 0.00 | 143.4 | 3,031.8 | 28.90 | 55.64 | 64.3 |
+| **kafka_hpa** | 2 MB | 4 VU | 572 | 0 | 552 | 0 | 20 | 0 | 0.00 | 369.8 | 5,578.2 | 18.94 | 35.31 | 107.5 |
+| **kafka_hpa** | 2 MB | 8 VU | 283 | 0 | 281 | 0 | 14 | 0 | 0.00 | 1,023.5 | 14,151.5 | 45.89 | 53.20 | 39.7 |
+| **kafka_hpa** | 10 MB | 1 VU | 91 | 0 | 88 | 0 | 3 | 0 | 0.00 | 612.0 | 5,046.0 | 15.45 | 33.22 | 12.9 |
+| **kafka_hpa** | 10 MB | 2 VU | 69 | 0 | 71 | 0 | 4 | 0 | 0.00 | 4,122.4 | 17,149.5 | 29.65 | 55.05 | 10.9 |
+| **openloop_fixed1** | 2 MB | 20/min | 33 | 0 | 33 | 0 | 0 | 0 | 0.00 | 1,259.3 | 2,673.0 | 2.36 | 5.94 | 21.0 |
+| **openloop_fixed1** | 2 MB | 60/min | 87 | 0 | 89 | 0 | 0 | 0 | 0.00 | 124.7 | 3,021.9 | 0.99 | 8.96 | 61.6 |
+| **openloop_hpa** | 2 MB | 20/min | 31 | 0 | 31 | 0 | 0 | 0 | 0.00 | 88.1 | 294.5 | 0.20 | 0.33 | 22.0 |
+| **openloop_hpa** | 2 MB | 60/min | 92 | 0 | 92 | 0 | 0 | 0 | 0.00 | 90.2 | 177.8 | 0.21 | 0.35 | 61.5 |
+
+### Per-Job Processing Overhead Breakdown
+To answer why `kafka_fixed1 2 MB` throughput caps at ~40 jobs/min (~1.44 s total turnaround) when pure OLS regression compute is < 1 second, a live analysis of job `450e87d1-50c8-4d10-819f-b89ccfc74571` (2 MB CSV, 18,893 rows, 10 columns, 45 pairwise regressions) was traced via microsecond-level timestamps across the backend and ML worker logs:
+1. **Queue Wait & Consumer Poll**: **786 ms** (from upload accepted at `13:30:10.512` to consumer poll at `13:30:11.298`).
+2. **Status Check & CSV Fetch (`GET /api/internal/analyses/{id}/data`)**: **338 ms** (backend validates token, executes `updateStatusIf` PENDING $\rightarrow$ PROCESSING in MySQL [224 ms], and streams CSV bytes over HTTP [114 ms]).
+3. **ML Compute**: **933 ms** (NumPy CSV parse [188 ms] + 45 OLS pairwise linear regression fits with $R^2$, slope, intercept, and p-value calculation [745 ms]).
+4. **Kafka Publish (`analysis.completed`)**: **79 ms** (serializing JSON payload and producing message to Kafka topic).
+5. **Kafka Manual Offset Commit**: **88 ms** (`commit_sync` back to Kafka broker).
+6. **Backend Completion Update**: **465 ms** (Spring Boot Kafka listener receives completion message, writes JSON result, and executes `markCompleted` in MySQL).
+- **Total Worker Turnaround Time**: **1,438 ms (~1.44 s)**. Single worker maximum throughput ceiling: $\frac{60\text{ s}}{1.44\text{ s/job}} \approx 41.7\text{ jobs/min}$, directly matching empirical benchmark observations.
 
 ### 1. Ingestion Latency Decoupling (Sync vs Kafka)
 ![Upload Response Time vs Load](docs/images/chart1_response_time_vs_load.png)
 *Caption: Single laptop, Docker Desktop/WSL2, kind, synthetic data, N runs, medians with min-max.*
 
-In the synchronous path, client HTTP connection duration is tied directly to backend thread pool availability and ML compute execution. Under concurrency (4 to 8 VUs), upload p50 latency on 2 MB files spikes to **477–3,850 ms (p95 up to 18,362 ms)**. Crucially, as `@Async("analysisExecutor")` exhausted its bounded queue capacity (15 tasks), the sync path threw task rejections (HTTP 503), accumulating **199 failed/rejected jobs** across the test suite. In the Kafka-backed architecture, the backend accepts the payload, persists the entity, publishes the analysis event, and responds with HTTP 202 in **171.3–759.7 ms (p50)**, absorbing load with **0 dropped requests**.
+In the synchronous path, client HTTP connection duration is tied directly to backend thread pool availability and ML compute execution. Under concurrency (4 to 8 VUs), upload p50 latency on 2 MB files spikes to **477–3,850 ms (p95 up to 18,362 ms)**. Crucially, as `@Async("analysisExecutor")` exhausted its bounded queue capacity (15 tasks), the sync path threw task rejections (HTTP 503), accumulating **199 failed/rejected jobs** across the test suite. In the Kafka-backed architecture, the backend accepts the payload, persists the entity, publishes the analysis event, and responds with HTTP 202 in **143.4–759.7 ms (p50)**, absorbing load with **0 dropped requests**.
 
 ### 2. Throughput & Autoscaling Elasticity
 ![Throughput vs Load](docs/images/chart2_throughput_vs_load.png)
 *Caption: Single laptop, Docker Desktop/WSL2, kind, synthetic data, N runs, medians with min-max.*
 
-- **Sync Path**: Ingestion throughput degrades sharply under concurrency due to bounded thread pool rejections (HTTP 503), plateauing at ~24–35 completed jobs/min.
-- **Kafka Path (Fixed 1 Replica)**: Buffers incoming bursts smoothly with 0 dropped jobs; single ML replica processes jobs at ~38–42 jobs/min.
-- **Kafka Path + HPA (1–3 Replicas)**: Automatically detects CPU utilization crossing the 60% threshold via metrics-server, scaling out ready ML replicas (from 1 to 3 pods) to clear burst queues and reaching **111.8–140.8 jobs/min** at 2–4 VUs.
+- **Sync Path**: Ingestion throughput degrades sharply under concurrency due to bounded thread pool rejections (HTTP 503), plateauing at ~24–38 completed jobs/min.
+- **Kafka Path (Fixed 1 Replica)**: Buffers incoming bursts smoothly with 0 dropped jobs; single ML replica processes jobs at ~38–62 jobs/min.
+- **Kafka Path + HPA (1–3 Replicas)**: Automatically detects CPU utilization crossing the 60% threshold via metrics-server, scaling out ready ML replicas (from 1 to 3 pods) to clear burst queues and reaching **77.2–107.5 jobs/min** at 2–4 VUs.
 
 ### 3. Horizontal Pod Autoscaler Dynamics
 ![Replicas Over Time Under Load](docs/images/chart3_replicas_over_time.png)
@@ -657,12 +712,14 @@ Plotted directly from high-frequency system monitor timeseries (`results/*_syste
 ![Recovery Timeline](docs/images/chart4_recovery_timeline.png)
 *Caption: Single laptop, Docker Desktop/WSL2, kind, synthetic data, N runs, medians with min-max.*
 
-Timeline from forced pod deletion (`kubectl delete pod` mid-computation):
+Measured across 3 single-clock trials on a 35 MB compute payload (`DEMO_COMPUTE_DELAY_SECONDS=0`, replica counts: exactly 1 backend pod, 1 ml-service pod):
 - `T+0.00s`: ML pod kill signal dispatched.
 - `T+0.80s`: Kubernetes ReplicaSet creates replacement pod.
 - `T+1.20s`: Container runtime initialized and uvicorn process starts.
 - `T+11.74–12.96s`: HTTP `/health` readiness probe passes (`initialDelaySeconds: 10`).
 - `T+3.02–5.19s`: Consumer resumes uncommitted partition offset and finishes in-flight analysis (`COMPLETED`).
+- **Trial 2 Ready at 33.5s**: In trial 2, the Docker daemon required 11.2s to tear down dead container cgroups and network interfaces before the kubelet could launch the replacement container (`qb4gm`). Container start occurred at T+13.5s, which added to `initialDelaySeconds: 10` yielded Ready at T+33.52s.
+- **Why Trial 1 Missed PROCESSING on 10MB**: With a 10 MB payload, compute finishes in ~1.5s, which fell entirely between 1.0s status polling ticks. Increasing test payload to 35 MB (4-line edit in `test_recovery_timeline.py`) extended compute to ~8.5s, allowing the poller to observe `PROCESSING`.
 
 ### Memory & Cluster Resource Reconciliation
 - **Resource Limits**:
@@ -671,12 +728,15 @@ Timeline from forced pod deletion (`kubectl delete pod` mid-computation):
   - `frontend`: 128 MiB limit (`k8s/frontend-deployment.yaml`).
   - Supporting infrastructure: MySQL (~780 MiB), Kafka broker (~600 MiB), Kind control plane (~600 MiB).
   - Theoretical total maximum committed budget: **5,692 MiB** (~5.56 GiB).
-- **Physical Memory**: On the 7,751 MiB host VM, measured `MemAvailable` remained between **1,947 MiB and 4,070 MiB** across all conditions. Free RAM was 65–83 MB because Linux buffers disk I/O in the page cache. Swap usage remained stable at **664–707 MiB** with 0 OOM kills and 0 container crashes across the entire matrix. Earlier speculative claims of "623 MiB headroom" are dropped in favor of these directly measured `MemAvailable` values.
+- **Physical Memory**: On the 7,751 MiB host VM, measured `MemAvailable` remained between **1,947 MiB and 4,070 MiB** across all conditions. Free RAM was 62–83 MB because Linux buffers disk I/O in the page cache. Swap usage remained stable at **141–707 MiB** with 0 OOM kills and 0 container crashes across the entire matrix.
 
 ### Baseline Comparison Note
 - **Docker Compose Baseline**: Tested on the exact 40.00 MB / 41,942,992-byte dataset (377,864 rows), ML compute duration is **3.79 s median** (3.51s–4.79s across runs) when thread-constrained (`OMP_NUM_THREADS=1`). The earlier ~13.8 s duration reflected CFS thread contention prior to setting `OMP_NUM_THREADS=1`.
 
 ### What Was NOT Established
+- **HPA 8-Client Upload Latency Contention**: Whether latency spikes at 8 VUs were caused by cold InnoDB buffer pools, kind control plane API throttling, or Docker socket overhead was **not established** (no kernel/InnoDB lock instrumentation was attached).
+- **e2e 40 MB Run-to-Run Variance**: Whether differences between iteration 1 (20.0s) and iteration 2 (6.8s) were caused by OS page-fault amortization or BLAS thread cache reuse was **not established** (CPU hardware performance counters were not measured).
+- **"MemAvailable Matches Headroom" Claim**: Replaced by direct measurement: `MemAvailable` incorporates reclaimable page cache and slab, so equating it 1:1 with unallocated container headroom is **not established**.
 - **Multi-Node Cluster Scheduling**: Tests ran on a single physical host inside a single kind node. Inter-node network hops, cross-availability-zone latency, and distributed volume attachments were not evaluated.
 - **Clinical Biomarker Efficacy**: All inputs and interaction matrices are synthetic calculations ($\Delta R^2$) without pharmacological validation.
 - **Long-Term Memory Churn**: Memory profiles were measured over 60–120s windows; multi-day memory creep under continuous gigabyte-scale churn was not measured.
