@@ -34,6 +34,9 @@ RUN groupadd -g 10001 epinet && \
 COPY --from=builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 ENV PYTHONUNBUFFERED=1
+# WHY single thread: prevents OpenBLAS/MKL thread oversubscription under container CPU quota
+ENV OMP_NUM_THREADS=1
+ENV OPENBLAS_NUM_THREADS=1
 
 COPY main.py .
 RUN chown -R epinet:epinet /app

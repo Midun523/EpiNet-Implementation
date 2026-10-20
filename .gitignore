@@ -48,3 +48,4 @@ k8s/ml-service-deployment.yaml
 
 # ─── Benchmark & Experiment Results ─────────────────
 results/
+tests/bench/data/

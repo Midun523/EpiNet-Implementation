@@ -112,6 +112,10 @@ services:
       # Internal compose service names for backend communication and Kafka consumer loop
       BACKEND_URL: http://backend:8080
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      # WHY OMP_NUM_THREADS=1 & OPENBLAS_NUM_THREADS=1: prevents OpenBLAS/MKL thread oversubscription
+      # and CFS CPU throttling under container quota, matching k8s single-thread setting
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
     depends_on:
       kafka:
         condition: service_healthy

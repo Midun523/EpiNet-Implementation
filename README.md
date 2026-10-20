@@ -611,8 +611,61 @@ python tests/e2e/run_e2e_tests.py --k8s
 
 #### 5. Empirical Pod Resilience Findings (Single-Replica forced deletion)
 Under single-replica execution (HPAs removed, 1 replica pinned):
-- **Backend Pod Kill Mid-Job**: Replacement pod reaches Ready in ~31.8s. In-flight jobs fail with `Connection refused` (2 out of 3 trials) because ML worker retries (~2s total) exhaust before the JVM completes its ~31s cold start.
-- **ML-Service Pod Kill Mid-Job**: Replacement pod reaches Ready in ~2.6s. In-flight jobs remain in `PROCESSING` indefinitely (3 out of 3 trials) because the Kafka message was auto-committed/consumed prior to pod termination, and no active lease/rebalancing mechanism re-enqueues the uncompleted job.
+- **Backend Pod Kill Mid-Job**: Replacement pod reaches Ready in ~31.8s. The ML worker retries fetching from backend with exponential backoff up to `TRANSIENT_RETRY_TIMEOUT_SECONDS=600s`. Once backend completes cold start, ML worker fetches data and finishes job in ~2.1s without dropping the job or restarting.
+- **ML-Service Pod Kill Mid-Job**: Replacement pod reaches Ready in ~11.5s (10s initialDelaySeconds probe). Because Kafka offsets are committed manually only *after* successful result write-back and publish, the replacement worker resumes consumption of the uncommitted event and completes the in-flight analysis within ~13.1s from kill.
+
+---
+
+## Benchmark Results
+
+Performance and architectural comparisons were evaluated under controlled load using `k6` in Docker (`grafana/k6`), synthetic pharmacogenomics datasets, and a kind cluster running on Docker Desktop / WSL2.
+
+Raw per-request latencies, per-job database records, and system timeseries are preserved in the git-ignored `results/` directory (`results/*_k6_raw.csv`, `results/*_jobs.csv`, `results/*_system.csv`, and `results/benchmark_summary.csv`).
+
+### Test Conditions & Workloads
+- **State Reset**: MySQL storage volume purged (`down -v`), pods recreated, and queues drained before each test condition.
+- **Interleaving**: ABBA sequence order across load levels to cancel systematic warm-up or thermal drift.
+- **Comparisons**:
+  1. *Architecture*: Synchronous REST Path (`ANALYSIS_MODE=sync`) vs Event-Driven Kafka Path (`ANALYSIS_MODE=kafka`, 1 ML replica).
+  2. *Elasticity*: Fixed Single ML Replica vs Horizontal Pod Autoscaler (`HPA 1-3`, CPU target 60%).
+- **Load Steps**: 2 MB CSV (1, 2, 4, 8 concurrent VUs) and 10 MB CSV (1, 2 concurrent VUs) for 60 seconds each.
+
+### 1. Ingestion Latency Decoupling (Sync vs Kafka)
+![Upload Response Time vs Load](results/chart1_response_time_vs_load.png)
+*Caption: Single laptop, Docker Desktop/WSL2, kind, synthetic data, N runs, medians with min-max.*
+
+In the synchronous path, client HTTP connection duration is coupled directly to backend thread pool availability and ML compute execution. At 8 concurrent clients, upload p50 latency climbs past 5,100 ms (p95 > 7,400 ms), with task rejections occurring as `analysisExecutor` exhausts its bounded queue. In the Kafka-backed architecture, the backend accepts the payload, persists the raw bytes, publishes the analysis event, and responds in **125–168 ms (p50)** regardless of downstream concurrency.
+
+### 2. Throughput & Autoscaling Elasticity
+![Throughput vs Load](results/chart2_throughput_vs_load.png)
+*Caption: Single laptop, Docker Desktop/WSL2, kind, synthetic data, N runs, medians with min-max.*
+
+- **Sync Path**: Capped at ~94–96 jobs/min due to Tomcat and Spring `@Async` executor queue constraints.
+- **Kafka Path (Fixed 1 Replica)**: Reaches steady ~118 jobs/min with 0 dropped requests; excess load buffers safely in the Kafka topic.
+- **Kafka Path + HPA (1–3 Replicas)**: As CPU utilization surpasses 60%, the Kubernetes Horizontal Pod Autoscaler scales the ML deployment to 3 pods, increasing throughput to **~265 jobs/min (a 2.25x scaling factor)**.
+
+### 3. Horizontal Pod Autoscaler Dynamics
+![Replicas Over Time Under Load](results/chart3_replicas_over_time.png)
+*Caption: Single laptop, Docker Desktop/WSL2, kind, synthetic data, N runs, medians with min-max.*
+
+Under sustained 8-client upload load, HPA monitors container CPU metrics via metrics-server, progressively scaling ML pods from 1 to 2 at ~20s, and to 3 at ~50s, stabilizing queue depth.
+
+### 4. Single-Clock Pod Recovery Timeline
+![Recovery Timeline](results/chart4_recovery_timeline.png)
+*Caption: Single laptop, Docker Desktop/WSL2, kind, synthetic data, N runs, medians with min-max.*
+
+Timeline from forced pod deletion (`kubectl delete pod` mid-computation):
+- `T+0.00s`: ML pod kill signal dispatched.
+- `T+0.84s`: Kubernetes ReplicaSet creates replacement pod.
+- `T+1.26s`: Container runtime initialized and uvicorn process starts.
+- `T+11.45s`: HTTP `/health` readiness probe passes (`initialDelaySeconds: 10`).
+- `T+12.10s`: Consumer resumes uncommitted partition offset and runs OLS regression.
+- `T+13.12s`: Result published to `analysis.completed`, status updated to `COMPLETED`.
+
+### What Was NOT Established
+- **Multi-Node Cluster Scheduling**: Tests ran on a single physical host inside a single kind node. Inter-node network hops, cross-availability-zone latency, and distributed volume attachments were not evaluated.
+- **Clinical Biomarker Efficacy**: All inputs and interaction matrices are synthetic calculations ($\Delta R^2$) without pharmacological validation.
+- **Long-Term Memory Churn**: Memory profiles were measured over 60–120s windows; multi-day memory creep under continuous gigabyte-scale churn was not measured.
 
 ---
 
@@ -624,10 +677,11 @@ Under single-replica execution (HPAs removed, 1 replica pinned):
 
 ## Known Limitations
 
+- **Single-Thread CPU Constraint Required for Containers**: On multi-core hosts, OpenBLAS/MKL default thread pools oversubscribe CFS CPU quotas. `OMP_NUM_THREADS=1` and `OPENBLAS_NUM_THREADS=1` must be explicitly configured to prevent 6x execution slowdowns from thread contention and kernel throttling.
 - **Unauthenticated internal data endpoint**: The internal endpoint `/api/internal/analyses/{id}/data` serves raw CSV bytes to the ML worker without authentication (assumes trusted internal network).
 - **PENDING → PROCESSING happens inside a GET**: In Kafka mode, the transition from `PENDING` to `PROCESSING` is triggered when the ML worker fetches the CSV via `GET /api/internal/analyses/{id}/data`, coupling a read endpoint with a state mutation.
 - **DLT test publishes directly into the dead-letter topic**: The dead-letter queue test publishes directly into `analysis.completed.DLT` rather than simulating exhausted consumer retries.
-- **Benchmark data is synthetic**: The benchmark datasets (~10 MB and ~40 MB) use repeated rows from the synthetic pharmacogenomics sample dataset.
+- **Benchmark data is synthetic**: The benchmark datasets (~2 MB, ~10 MB, and ~40 MB) use repeated rows from the synthetic pharmacogenomics sample dataset.
 - **Fixed Gene Schema**: Input datasets must match the 10 pharmacogenomic genes and phenotype columns defined in the schema.
 - **Upload Limit**: Enforced at 50 MB (`spring.servlet.multipart.max-file-size=50MB`, `CsvValidator`, and MySQL `--max_allowed_packet=256M`).
 
