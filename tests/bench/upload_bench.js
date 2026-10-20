@@ -12,6 +12,7 @@ export const options = {
       executor: 'constant-vus',
       vus: parseInt(__ENV.VUS || '1'),
       duration: __ENV.DURATION || '60s',
+      gracefulStop: '15s',
     },
   },
 };

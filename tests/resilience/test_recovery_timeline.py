@@ -268,8 +268,8 @@ def run_one_recovery_trial(trial_idx, csv_10mb):
 
 
 def main():
-    print("Generating 10 MB CSV for ML Pod Recovery Trials...")
-    csv_10mb = generate_csv_bytes(10.0)
+    print("Generating 35 MB CSV for ML Pod Recovery Trials (ensures active PROCESSING during kill)...")
+    csv_10mb = generate_csv_bytes(35.0)
     print(f"Generated CSV bytes: {len(csv_10mb)} bytes")
 
     results = []

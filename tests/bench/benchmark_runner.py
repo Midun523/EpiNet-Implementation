@@ -160,16 +160,21 @@ class SystemMonitor(threading.Thread):
                 if len(parts) >= 3 and "OOM" in parts[2]:
                     oom_count += 1
 
-            # VM memory
+            # VM memory & Swap
             wsl_mem, _, _ = run_cmd(["wsl", "free", "-m"])
             free_mb = 0
             avail_mb = 0
+            swap_used_mb = 0
             for line in wsl_mem.splitlines():
                 if line.startswith("Mem:"):
                     cols = line.split()
                     if len(cols) >= 7:
                         free_mb = int(cols[3])
                         avail_mb = int(cols[6])
+                elif line.startswith("Swap:"):
+                    cols = line.split()
+                    if len(cols) >= 3:
+                        swap_used_mb = int(cols[2])
 
             self.records.append({
                 "timestamp_utc": t_str,
@@ -177,7 +182,8 @@ class SystemMonitor(threading.Thread):
                 "ml_restarts": restarts_sum,
                 "ml_oom_killed": oom_count,
                 "vm_free_mb": free_mb,
-                "vm_avail_mb": avail_mb
+                "vm_avail_mb": avail_mb,
+                "swap_used_mb": swap_used_mb,
             })
             time.sleep(self.interval)
 
@@ -246,27 +252,28 @@ def run_k6_load(csv_file_name: str, vus: int, duration_sec: int, run_id: str):
     ]
     print(f"[RUNNER] Executing k6: {csv_file_name} @ {vus} VUs for {duration_sec}s...")
     t0 = time.time()
-    out, err, code = run_cmd(cmd, timeout=duration_sec + 60)
+    out, err, code = run_cmd(cmd, timeout=duration_sec + 180)
     dur = time.time() - t0
     print(f"[RUNNER] k6 finished in {dur:.2f}s (Exit code: {code})")
     return k6_raw_out
 
 
-def wait_for_jobs_drain(timeout_sec: int = 25):
+def wait_for_jobs_drain(timeout_sec: int = 45):
     """Waits until all active jobs reach COMPLETED or FAILED, or timeout."""
     print("[RUNNER] Waiting for outstanding jobs to complete...")
     t0 = time.time()
     while time.time() - t0 < timeout_sec:
-        out, _, _ = run_cmd(["docker", "compose", "exec", "-T", "mysql", "mysql", "-uroot", "-proot_pass", "-e", "SELECT COUNT(*) FROM epinet.analysis_run WHERE status IN ('PENDING', 'PROCESSING');"])
+        out, _, _ = run_cmd(["docker", "compose", "exec", "-T", "mysql", "mysql", "-uroot", "-proot_pass", "-e", "SELECT COUNT(*) FROM epinet.analysis_run WHERE status IN ('PENDING', 'PROCESSING', 'UPLOADED');"])
         lines = out.splitlines()
         if len(lines) > 1 and lines[1].strip() == "0":
-            print("[RUNNER] Queue drained (0 active jobs).")
+            print(f"[RUNNER] Queue drained (0 active jobs) in {time.time() - t0:.2f}s.")
             return
         time.sleep(1)
-    print("[RUNNER] Drain wait timed out (or all active compute finished).")
+    print(f"[RUNNER] Drain wait reached {timeout_sec}s (recording state).")
 
 
 def run_benchmark_trial(condition: str, file_mb: int, vus: int, rep: int, duration: int):
+    t_trial_start = time.time()
     run_id = f"{condition}_{file_mb}mb_{vus}vu_rep{rep}_{int(time.time())}"
     print(f"\n{'='*70}\nTRIAL START: Condition={condition} | File={file_mb}MB | VUs={vus} | Rep={rep}\n{'='*70}")
 
@@ -277,17 +284,18 @@ def run_benchmark_trial(condition: str, file_mb: int, vus: int, rep: int, durati
     monitor = SystemMonitor(run_id=run_id, interval_sec=2.0)
     monitor.start()
 
-    # Run k6
-    csv_filename = f"benchmark_{file_mb}mb.csv"
-    k6_out = run_k6_load(csv_filename, vus, duration, run_id)
+    try:
+        # Run k6
+        csv_filename = f"benchmark_{file_mb}mb.csv"
+        k6_out = run_k6_load(csv_filename, vus, duration, run_id)
 
-    # Wait for completion of any queued tasks
-    wait_for_jobs_drain()
-
-    # Stop monitor and save
-    monitor.stop()
-    sys_out = os.path.join(RESULTS_DIR, f"{run_id}_system.csv")
-    monitor.save(sys_out)
+        # Wait for completion of any queued tasks
+        wait_for_jobs_drain()
+    finally:
+        # Stop monitor and save
+        monitor.stop()
+        sys_out = os.path.join(RESULTS_DIR, f"{run_id}_system.csv")
+        monitor.save(sys_out)
 
     # Extract database jobs
     jobs_out = os.path.join(RESULTS_DIR, f"{run_id}_jobs.csv")
@@ -295,13 +303,17 @@ def run_benchmark_trial(condition: str, file_mb: int, vus: int, rep: int, durati
     print(f"[TRIAL COMPLETE] Saved {job_count} job records -> {jobs_out}")
     print(f"[TRIAL COMPLETE] Saved system timeseries -> {sys_out}")
 
+    wall_time_sec = round(time.time() - t_trial_start, 2)
+    print(f"[TRIAL COMPLETE] Real Wall Time: {wall_time_sec}s")
+
     return {
         "run_id": run_id,
         "condition": condition,
         "file_mb": file_mb,
         "vus": vus,
         "rep": rep,
-        "jobs_count": job_count
+        "jobs_count": job_count,
+        "wall_time_sec": wall_time_sec,
     }
 
 

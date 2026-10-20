@@ -468,8 +468,8 @@ try:
     proc_10mb_sec = round(time.time() - t_proc_10, 3)
     print(f"  10 MB job completed in {proc_10mb_sec}s! Status: {final_st_10.get('status')}")
     assert success_10, f"10 MB job did not complete: {transitions_10}"
-    # Strict lifecycle assertion: 10 MB payload duration (>1s) guarantees polling captures PROCESSING
-    assert "PROCESSING" in transitions_10, f"Expected PROCESSING in transitions for 10 MB job, saw: {transitions_10}"
+    # On 10 MB, single-threaded execution computes in ~0.5s; verify terminal COMPLETED
+    assert final_st_10.get("status") == "COMPLETED", f"Expected COMPLETED, got {final_st_10.get('status')}"
 
     # 2. Test ~40 MB Upload - Run 3 times to measure min / median / max
     print("\n  Benchmarking ~40 MB CSV (running 3 iterations to measure min/median/max analysis time)...")
@@ -491,6 +491,8 @@ try:
         success_40, transitions_40, final_st_40 = poll_for_status(run_id, "COMPLETED", 120)
         proc_sec = round(time.time() - t_proc_40, 3)
         assert success_40, f"Iteration {iteration} did not complete: {transitions_40}"
+        # Strict lifecycle assertion: 40 MB payload duration (~2-4s) guarantees polling captures PROCESSING
+        assert "PROCESSING" in transitions_40, f"Expected PROCESSING in transitions for 40 MB job, saw: {transitions_40}"
         print(f"    [Iteration {iteration}/3] Upload: {up_sec}s | Analysis: {proc_sec}s | Status: {final_st_40.get('status')}")
         runs_40mb.append({
             "iteration": iteration,

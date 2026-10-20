@@ -98,6 +98,7 @@ def parse_system(filepath):
     oom = 0
     min_free = 999999
     min_avail = 999999
+    max_swap = 0
     ts_data = []
     with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
         reader = csv.DictReader(f)
@@ -108,15 +109,17 @@ def parse_system(filepath):
                 o = int(row.get("ml_oom_killed", 0))
                 free_mb = int(row.get("vm_free_mb", 0))
                 avail_mb = int(row.get("vm_avail_mb", 0))
+                swap_mb = int(row.get("swap_used_mb", 0))
                 if r > max_reps: max_reps = r
                 if rst > restarts: restarts = rst
                 if o > oom: oom = o
                 if free_mb < min_free and free_mb > 0: min_free = free_mb
                 if avail_mb < min_avail and avail_mb > 0: min_avail = avail_mb
-                ts_data.append((row.get("timestamp_utc"), r, free_mb))
+                if swap_mb > max_swap: max_swap = swap_mb
+                ts_data.append((row.get("timestamp_utc"), r, free_mb, avail_mb, swap_mb))
             except ValueError:
                 pass
-    return max_reps, restarts, oom, (min_free if min_free != 999999 else 0), ts_data
+    return max_reps, restarts, oom, (min_free if min_free != 999999 else 0), (min_avail if min_avail != 999999 else 0), max_swap, ts_data
 
 
 def process_all_results():
@@ -155,7 +158,7 @@ def process_all_results():
             
         up_p50, up_p95, up_failed = parse_k6_raw(k6_f) if os.path.exists(k6_f) else (0, 0, 0)
         job_p50, job_p95, comp_jobs, failed_jobs = parse_jobs(jf)
-        max_reps, restarts, oom, min_free, ts_data = parse_system(sys_f) if os.path.exists(sys_f) else (1, 0, 0, 0, [])
+        max_reps, restarts, oom, min_free, min_avail, max_swap, ts_data = parse_system(sys_f) if os.path.exists(sys_f) else (1, 0, 0, 0, 0, 0, [])
         
         # Calculate throughput (jobs/min) from actual trial duration
         if len(ts_data) > 1 and ts_data[0][0] and ts_data[-1][0]:
@@ -186,6 +189,8 @@ def process_all_results():
             "restarts": restarts,
             "oom_killed": oom,
             "min_vm_free_mb": min_free,
+            "min_vm_avail_mb": min_avail,
+            "max_swap_used_mb": max_swap,
             "timeseries": ts_data
         })
         
@@ -398,6 +403,8 @@ def main():
         restarts = [r["restarts"] for r in rows]
         ooms = [r["oom_killed"] for r in rows]
         free_mbs = [r["min_vm_free_mb"] for r in rows if r["min_vm_free_mb"] > 0] or [0]
+        avail_mbs = [r["min_vm_avail_mb"] for r in rows if r["min_vm_avail_mb"] > 0] or [0]
+        swap_mbs = [r["max_swap_used_mb"] for r in rows] or [0]
         failed_sum = sum(r["failed_jobs"] for r in rows)
         
         med_up_p50 = float(np.median(up_p50s))
@@ -429,7 +436,9 @@ def main():
             "failed_jobs_total": failed_sum,
             "pod_restarts_max": max(restarts),
             "oom_killed_max": max(ooms),
-            "min_vm_free_mb": min(free_mbs)
+            "min_vm_free_mb": min(free_mbs),
+            "min_vm_avail_mb": min(avail_mbs),
+            "max_swap_used_mb": max(swap_mbs)
         })
         
     summary_csv_path = os.path.join(RESULTS_DIR, "benchmark_summary.csv")
