@@ -1,23 +1,17 @@
-condition,file_mb,load_level,runs,requests_202,requests_503,jobs_completed_k6,jobs_completed_drain,jobs_pending_end,jobs_failed,drain_time_sec_median,upload_p50_ms_median,upload_p50_ms_min,upload_p50_ms_max,upload_p95_ms_median,job_p50_sec_median,job_p95_sec_median,throughput_jobs_min_median,throughput_jobs_min_min,throughput_jobs_min_max,pod_restarts_max,oom_killed_max,min_vm_free_mb,min_vm_avail_mb,max_swap_used_mb
-kafka_fixed1,2,1vu,3,185,0,145,0,40,0,0.00,171.35,128.72,260.68,667.36,12.579,56.322,38.8,21.6,99.0,0,0,83,4069,695
-kafka_fixed1,2,2vu,3,376,0,164,0,212,0,0.00,184.54,144.92,294.37,848.48,55.221,67.026,62.9,37.2,88.6,0,0,72,3763,695
-kafka_fixed1,2,4vu,3,327,0,6,0,321,0,0.00,237.09,213.91,402.73,4576.46,66.340,70.770,5.0,5.0,5.0,0,0,75,3485,696
-kafka_fixed1,2,8vu,3,193,0,0,0,205,0,0.00,759.68,397.34,19157.65,2360.01,N/A,N/A,N/A,N/A,N/A,0,0,75,3343,696
-kafka_fixed1,10,1vu,3,20,0,0,0,20,0,0.00,1980.48,1255.43,2902.50,6521.05,N/A,N/A,N/A,N/A,N/A,0,0,75,3144,697
-kafka_fixed1,10,2vu,3,40,0,0,0,40,0,0.00,1491.11,786.33,20969.33,8227.02,N/A,N/A,N/A,N/A,N/A,0,0,71,2513,699
-kafka_hpa,2,1vu,6,392,0,377,0,15,0,0.00,151.54,91.97,223.06,1347.96,14.826,32.906,77.2,43.5,158.1,3,0,70,2682,700
-kafka_hpa,2,2vu,6,669,0,658,0,11,0,0.00,143.38,84.29,307.05,3031.80,28.898,55.642,64.3,31.8,140.7,3,0,67,3113,702
-kafka_hpa,2,4vu,6,572,0,552,0,20,0,0.00,369.83,181.15,4679.80,5578.18,18.936,35.308,107.5,38.5,183.6,3,0,70,2996,704
-kafka_hpa,2,8vu,6,283,0,281,0,14,0,0.00,1023.50,535.51,18473.97,14151.45,45.886,53.201,39.7,10.6,102.7,3,0,67,2840,706
-kafka_hpa,10,1vu,6,91,0,88,0,3,0,0.00,611.98,402.04,1291.53,5045.95,15.454,33.215,12.9,8.0,45.1,3,0,71,2461,707
-kafka_hpa,10,2vu,6,69,0,71,0,4,0,0.00,4122.40,831.83,23166.85,17149.51,29.654,55.047,10.9,3.2,18.5,3,0,62,1947,707
-openloop_fixed1,2,20rate,3,33,0,33,0,0,0,0.00,1259.25,91.53,3753.36,2673.01,2.361,5.937,21.0,15.0,21.8,3,0,82,2952,141
-openloop_fixed1,2,60rate,3,87,0,89,0,0,0,0.00,124.65,116.44,9318.53,3021.85,0.985,8.958,61.6,22.6,61.6,3,0,77,3284,144
-openloop_hpa,2,20rate,3,31,0,31,0,0,0,0.00,88.12,70.27,121.06,294.53,0.199,0.332,22.0,21.9,22.1,3,0,77,3250,144
-openloop_hpa,2,60rate,3,92,0,92,0,0,0,0.00,90.20,63.12,115.58,177.83,0.206,0.349,61.5,18.5,61.6,3,0,73,3253,148
-sync,2,1vu,3,45,1,45,0,0,1,0.00,861.61,511.86,2401.57,3216.13,15.107,18.746,27.6,17.6,38.6,0,0,722,4070,664
-sync,2,2vu,3,80,63,80,0,0,63,0.00,374.64,229.69,722.65,6230.23,12.996,28.643,32.6,30.3,47.9,0,0,77,3866,670
-sync,2,4vu,3,57,87,57,0,0,87,0.00,477.06,340.09,7698.83,10092.63,13.921,22.186,38.1,12.3,41.6,0,0,74,3500,671
-sync,2,8vu,3,54,48,57,0,0,48,0.00,3850.06,609.16,18362.43,17261.25,28.187,42.683,23.8,20.2,26.2,0,0,66,3533,675
-sync,10,1vu,3,36,0,35,0,1,0,0.00,718.10,635.50,4516.65,4845.56,29.039,57.583,9.3,5.0,9.3,0,0,74,2436,690
-sync,10,2vu,3,29,0,27,0,5,0,0.00,1712.11,1104.58,4090.13,11061.04,60.893,80.247,4.3,3.7,15.9,0,0,70,2300,694
+condition,file_mb,load_level,runs,requests_accepted_total,requests_202_total,requests_503_total,jobs_completed_k6_total,jobs_completed_drain_total,jobs_pending_end_total,jobs_failed_total,drain_time_sec_median,upload_p50_ms_median,upload_p50_ms_min,upload_p50_ms_max,upload_p95_ms_median,job_p50_sec_median,job_p95_sec_median,throughput_jobs_min_median,throughput_jobs_min_min,throughput_jobs_min_max,pod_restarts_max,oom_killed_max,min_vm_free_mb,min_vm_avail_mb,max_swap_used_mb,file_list
+kafka_hpa,2,1vu,3,213,213,0,110,103,0,0,10.36,126.36,91.97,135.00,1506.86,14.989,29.509,102.7,45.8,158.1,1,0,70,2682,45,kafka_hpa_2mb_1vu_rep1_1792484863_jobs.csv; kafka_hpa_2mb_1vu_rep2_1792485486_jobs.csv; kafka_hpa_2mb_1vu_rep3_1792486179_jobs.csv
+kafka_hpa,2,2vu,3,345,345,0,84,261,0,0,121.11,89.97,84.29,114.40,3417.22,97.283,136.355,56.7,45.6,71.9,1,0,67,3113,72,kafka_hpa_2mb_2vu_rep1_1792484909_jobs.csv; kafka_hpa_2mb_2vu_rep2_1792485591_jobs.csv; kafka_hpa_2mb_2vu_rep3_1792486238_jobs.csv
+kafka_hpa,2,4vu,3,221,221,0,64,157,0,0,14.38,520.28,181.15,4679.80,5686.84,16.718,32.958,89.8,38.5,125.1,1,0,73,2996,77,kafka_hpa_2mb_4vu_rep1_1792484977_jobs.csv; kafka_hpa_2mb_4vu_rep2_1792485786_jobs.csv; kafka_hpa_2mb_4vu_rep3_1792486411_jobs.csv
+kafka_hpa,2,8vu,3,161,156,0,28,133,0,0,32.67,16097.27,535.51,18473.97,23652.39,46.651,59.589,15.9,10.6,102.7,1,0,70,2840,80,kafka_hpa_2mb_8vu_rep1_1792485061_jobs.csv; kafka_hpa_2mb_8vu_rep2_1792485933_jobs.csv; kafka_hpa_2mb_8vu_rep3_1792486470_jobs.csv
+kafka_hpa,10,1vu,3,44,44,0,18,26,0,0,22.29,406.23,402.04,1291.53,10494.09,30.153,40.657,10.0,8.0,11.2,1,0,73,2606,92,kafka_hpa_10mb_1vu_rep1_1792485199_jobs.csv; kafka_hpa_10mb_1vu_rep2_1792486052_jobs.csv; kafka_hpa_10mb_1vu_rep3_1792486556_jobs.csv
+kafka_hpa,10,2vu,3,36,32,0,10,26,0,0,31.08,4038.95,995.62,23166.85,18717.99,49.692,63.272,9.0,3.2,18.5,1,0,62,2442,106,kafka_hpa_10mb_2vu_rep1_1792485400_jobs.csv; kafka_hpa_10mb_2vu_rep2_1792486102_jobs.csv; kafka_hpa_10mb_2vu_rep3_1792486626_jobs.csv
+openloop_fixed1,2,20rate,3,33,33,0,26,7,0,0,1.06,1259.25,91.53,3753.36,2673.01,2.361,5.937,N/A,N/A,N/A,1,0,82,2952,141,openloop_kafka_fixed1_2mb_20rate_rep1_1792486723_jobs.csv; openloop_kafka_fixed1_2mb_20rate_rep2_1792486916_jobs.csv; openloop_kafka_fixed1_2mb_20rate_rep3_1792487147_jobs.csv
+openloop_fixed1,2,60rate,3,89,87,0,71,18,0,0,0.97,124.65,116.44,9318.53,3021.85,0.985,8.958,N/A,N/A,N/A,1,0,77,3284,144,openloop_kafka_fixed1_2mb_60rate_rep1_1792486759_jobs.csv; openloop_kafka_fixed1_2mb_60rate_rep2_1792486963_jobs.csv; openloop_kafka_fixed1_2mb_60rate_rep3_1792487185_jobs.csv
+openloop_hpa,2,20rate,3,31,31,0,30,1,0,0,0.00,88.12,70.27,121.06,294.53,0.199,0.332,N/A,N/A,N/A,1,0,77,3250,144,openloop_kafka_hpa_2mb_20rate_rep1_1792486840_jobs.csv; openloop_kafka_hpa_2mb_20rate_rep2_1792487002_jobs.csv; openloop_kafka_hpa_2mb_20rate_rep3_1792487220_jobs.csv
+openloop_hpa,2,60rate,3,92,92,0,88,4,0,0,0.75,90.20,63.12,115.58,177.83,0.206,0.349,N/A,N/A,N/A,1,0,73,3253,148,openloop_kafka_hpa_2mb_60rate_rep1_1792486880_jobs.csv; openloop_kafka_hpa_2mb_60rate_rep2_1792487037_jobs.csv; openloop_kafka_hpa_2mb_60rate_rep3_1792487256_jobs.csv
+sync,2,1vu,3,46,45,1,22,23,0,1,9.27,861.61,511.86,2401.57,3216.13,15.107,18.746,27.6,17.6,38.6,0,0,722,4070,664,sync_2mb_1vu_rep1_1792477774_jobs.csv; sync_2mb_1vu_rep2_1792480345_jobs.csv; sync_2mb_1vu_rep3_1792480880_jobs.csv
+sync,2,2vu,3,143,80,63,51,29,0,63,23.73,374.64,229.69,722.65,6230.23,12.996,28.643,32.6,30.3,47.9,0,0,77,3866,670,sync_2mb_2vu_rep1_1792477812_jobs.csv; sync_2mb_2vu_rep2_1792480384_jobs.csv; sync_2mb_2vu_rep3_1792480917_jobs.csv
+sync,2,4vu,3,144,57,87,23,34,0,87,16.08,477.06,340.09,7698.83,10092.63,13.921,22.186,38.1,12.3,41.6,0,0,74,3500,671,sync_2mb_4vu_rep1_1792477865_jobs.csv; sync_2mb_4vu_rep2_1792480438_jobs.csv; sync_2mb_4vu_rep3_1792480980_jobs.csv
+sync,2,8vu,3,105,54,48,14,43,0,48,22.57,3850.06,609.16,18362.43,17261.25,28.187,42.683,23.8,20.2,26.2,0,0,66,3533,675,sync_2mb_8vu_rep1_1792477950_jobs.csv; sync_2mb_8vu_rep2_1792480492_jobs.csv; sync_2mb_8vu_rep3_1792481018_jobs.csv
+sync,10,1vu,3,36,36,0,13,22,1,0,73.46,718.10,635.50,4516.65,4845.56,29.039,57.583,9.3,5.0,9.3,0,0,74,2436,690,sync_10mb_1vu_rep1_1792478008_jobs.csv; sync_10mb_1vu_rep2_1792480550_jobs.csv; sync_10mb_1vu_rep3_1792481075_jobs.csv
+sync,10,2vu,3,32,29,0,6,21,5,0,28.82,1712.11,1104.58,4090.13,11061.04,60.893,80.247,4.3,3.7,15.9,0,0,70,2300,694,sync_10mb_2vu_rep1_1792478068_jobs.csv; sync_10mb_2vu_rep2_1792480656_jobs.csv; sync_10mb_2vu_rep3_1792481177_jobs.csv

@@ -47,21 +47,34 @@ def truncate_db():
     run_cmd(["docker", "compose", "exec", "-T", "mysql", "mysql", "-uroot", "-proot_pass", "-e", "TRUNCATE TABLE epinet.analysis_run;"])
 
 
-def reset_hpa_to_single_replica():
-    """Ensures HPA is recreated and ml-service has exactly 1 ready replica."""
-    print("  [HPA RESET] Resetting ml-service to 1 replica and settling HPA...")
-    run_cmd(["kubectl", "delete", "hpa", "ml-service-hpa", "--ignore-not-found=true"])
-    run_cmd(["kubectl", "scale", "deployment", "ml-service", "--replicas=1"])
-    run_cmd(["kubectl", "rollout", "status", "deployment", "ml-service", "--timeout=60s"])
-    run_cmd(["kubectl", "apply", "-f", "k8s/hpa.yaml"])
-    
-    # Wait for HPA to observe 1 replica
-    for _ in range(30):
-        out, _, _ = run_cmd(["kubectl", "get", "deployment", "ml-service", "-o", "jsonpath={.status.readyReplicas}"])
-        if out.strip() == "1":
-            break
-        time.sleep(1)
-    time.sleep(2)
+def reset_hpa_to_single_replica(max_retries=5):
+    """Ensures HPA is recreated and ml-service has exactly 1 ready replica, retrying and aborting if not held."""
+    for attempt in range(1, max_retries + 1):
+        print(f"  [HPA RESET] Resetting ml-service to 1 replica (attempt {attempt}/{max_retries})...")
+        run_cmd(["kubectl", "delete", "hpa", "ml-service-hpa", "--ignore-not-found=true"])
+        run_cmd(["kubectl", "scale", "deployment", "ml-service", "--replicas=1"])
+        run_cmd(["kubectl", "rollout", "status", "deployment", "ml-service", "--timeout=60s"])
+        run_cmd(["kubectl", "apply", "-f", "k8s/hpa.yaml"])
+        
+        settled = False
+        for _ in range(30):
+            reps = get_ml_replicas()
+            if reps == 1:
+                settled = True
+                break
+            time.sleep(1)
+        
+        if settled:
+            time.sleep(3)
+            if get_ml_replicas() == 1:
+                print("  [HPA RESET] Replicas successfully verified and settled at 1.")
+                return 1
+            
+        print(f"  [HPA RESET WARNING] Attempt {attempt} failed to settle at 1 replica (current: {get_ml_replicas()}). Retrying...")
+        time.sleep(2)
+        
+    rep_final = get_ml_replicas()
+    raise RuntimeError(f"HPA reset failed to achieve 1 replica after {max_retries} attempts. Current replicas: {rep_final}. Aborting cell.")
 
 
 def get_ml_replicas():
@@ -299,7 +312,9 @@ def run_hpa_suite(duration=30):
             # Step 1: Ensure HPA reset to 1 replica
             reset_hpa_to_single_replica()
             rep_start = get_ml_replicas()
-            print(f"  -> Replicas at cell start: {rep_start}")
+            if rep_start != 1:
+                raise RuntimeError(f"HPA cell start assertion failed: replicas={rep_start} != 1. Aborting run.")
+            print(f"  -> Replicas at cell start verified: {rep_start}")
 
             # Step 2: Clean database
             truncate_db()

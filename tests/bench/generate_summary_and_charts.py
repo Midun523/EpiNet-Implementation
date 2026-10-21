@@ -2,24 +2,20 @@
 """
 tests/bench/generate_summary_and_charts.py
 
-Reads raw CSVs from results/ folder:
-  - <run_id>_k6_raw.csv: raw per-request latencies and HTTP status codes
-  - <run_id>_jobs.csv: per-job database execution times and statuses
-  - <run_id>_system.csv: ML replicas, restarts, VM free memory timeseries
-  - ml_pod_recovery_trials.json: single-clock recovery milestones
+Reads raw benchmark files based on explicit suite manifests:
+  - results/bench_manifest_1792477680.json (sync closed-loop baseline)
+  - results/hpa_openloop_manifest_1792484863.json (kafka_hpa closed-loop uncensored & open-loop suite)
 
-Generates:
-  - results/benchmark_summary.csv (Comprehensive summary table)
-  - results/chart1_response_time_vs_load.png
-  - results/chart2_throughput_vs_load.png
-  - results/chart3_replicas_over_time.png
-  - results/chart4_recovery_timeline.png
-  - Copies all charts to docs/images/
+Performs:
+  1. Per-run extraction and validation.
+  2. Strict consistency check: completed + pending + failed == accepted for EVERY run.
+  3. Explicit aggregation into medians vs totals with Runs count and file lists.
+  4. Generates results/benchmark_summary.csv and docs/benchmark_summary.csv.
+  5. Generates publication-ready charts (chart1 to chart4) and copies to docs/images/.
 """
 
 import csv
 import datetime
-import glob
 import json
 import math
 import os
@@ -32,7 +28,8 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 
 RESULTS_DIR = os.path.abspath("results")
-DOCS_IMG_DIR = os.path.abspath("docs/images")
+DOCS_DIR = os.path.abspath("docs")
+DOCS_IMG_DIR = os.path.join(DOCS_DIR, "images")
 CAPTION_TEXT = "Single laptop, Docker Desktop/WSL2, kind, synthetic data, N runs, medians with min-max."
 
 
@@ -110,18 +107,21 @@ def parse_jobs(filepath, k6_end_ts=None):
     t_last_complete = None
 
     if not os.path.exists(filepath):
-        return None, None, 0, 0, 0, 0, None, None, 0.0
+        return None, None, 0, 0, 0, 0, None, None, 0.0, 0
 
+    job_rows = []
     with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
         reader = csv.DictReader(f)
         for row in reader:
+            job_rows.append(row)
             st = row.get("status")
             c_at = row.get("created_at")
             comp_at = row.get("completed_at")
 
             if c_at and c_at != "NULL":
                 try:
-                    dt = datetime.datetime.fromisoformat(c_at).timestamp()
+                    # Explicit UTC timezone conversion
+                    dt = datetime.datetime.fromisoformat(c_at).replace(tzinfo=datetime.timezone.utc).timestamp()
                     if t_first_create is None or dt < t_first_create:
                         t_first_create = dt
                 except Exception:
@@ -136,7 +136,8 @@ def parse_jobs(filepath, k6_end_ts=None):
                         pass
                 if comp_at and comp_at != "NULL":
                     try:
-                        dt = datetime.datetime.fromisoformat(comp_at).timestamp()
+                        # Explicit UTC timezone conversion to match k6 Unix timestamps
+                        dt = datetime.datetime.fromisoformat(comp_at).replace(tzinfo=datetime.timezone.utc).timestamp()
                         if t_last_complete is None or dt > t_last_complete:
                             t_last_complete = dt
                         if k6_end_ts and dt <= k6_end_ts:
@@ -155,12 +156,12 @@ def parse_jobs(filepath, k6_end_ts=None):
     p50 = percentile(durations, 50)
     p95 = percentile(durations, 95)
 
-    # Calculate drain time: from k6_end_ts to t_last_complete (if completed during drain)
     drain_time = 0.0
     if k6_end_ts and t_last_complete and t_last_complete > k6_end_ts:
         drain_time = max(0.0, t_last_complete - k6_end_ts)
 
-    return p50, p95, comp_k6, comp_drain, pending_end, failed, t_first_create, t_last_complete, round(drain_time, 2)
+    accepted = len(job_rows)
+    return p50, p95, comp_k6, comp_drain, pending_end, failed, t_first_create, t_last_complete, round(drain_time, 2), accepted
 
 
 def parse_system(filepath):
@@ -207,85 +208,118 @@ def parse_system(filepath):
     return max_reps, restarts, oom, min_free, min_avail, max_swap, ts_data
 
 
-def process_all_results():
-    job_files = glob.glob(os.path.join(RESULTS_DIR, "*_jobs.csv"))
-    print(f"[ANALYSIS] Found {len(job_files)} job files in {RESULTS_DIR}")
+def load_runs_from_manifests():
+    """
+    Builds explicit run list directly from manifest JSON files.
+    - Excludes closed-loop kafka_fixed1 (which had a 45s drain-cap / censored cells).
+    - Closed-loop comparison is sync vs kafka_hpa.
+    - Fixed1 vs HPA is compared strictly in open loop.
+    """
+    m1_path = os.path.join(RESULTS_DIR, "bench_manifest_1792477680.json")
+    m2_path = os.path.join(RESULTS_DIR, "hpa_openloop_manifest_1792484863.json")
+
+    manifest_entries = []
+
+    # 1. Sync closed-loop baseline from m1
+    if os.path.exists(m1_path):
+        with open(m1_path, "r") as f:
+            m1 = json.load(f)
+        for r in m1:
+            if r.get("condition") == "sync":
+                manifest_entries.append({
+                    "run_id": r["run_id"],
+                    "condition": "sync",
+                    "file_mb": r["file_mb"],
+                    "load_level": f"{r['vus']}vu",
+                    "vus": r["vus"],
+                    "rep": r["rep"],
+                    "is_open_loop": False,
+                    "manifest_source": "bench_manifest_1792477680.json"
+                })
+
+    # 2. HPA closed-loop & Open-loop suite from m2
+    if os.path.exists(m2_path):
+        with open(m2_path, "r") as f:
+            m2 = json.load(f)
+        for r in m2:
+            is_ol = r.get("type") == "open_loop" or "openloop" in r.get("run_id", "")
+            cond = r["condition"]
+            if is_ol:
+                if cond == "kafka_fixed1":
+                    cond = "openloop_fixed1"
+                elif cond == "kafka_hpa":
+                    cond = "openloop_hpa"
+                rate = r.get("rate_per_min", 20)
+                load_lvl = f"{rate}rate"
+                vus_val = rate
+            else:
+                load_lvl = f"{r['vus']}vu"
+                vus_val = r["vus"]
+
+            manifest_entries.append({
+                "run_id": r["run_id"],
+                "condition": cond,
+                "file_mb": r["file_mb"],
+                "load_level": load_lvl,
+                "vus": vus_val,
+                "rep": r["rep"],
+                "is_open_loop": is_ol,
+                "manifest_source": "hpa_openloop_manifest_1792484863.json"
+            })
+
+    print(f"[MANIFEST] Loaded {len(manifest_entries)} explicit benchmark runs across suites.")
+    return manifest_entries
+
+
+def process_manifest_runs(manifest_entries):
+    print("\n" + "=" * 90)
+    print("RUN-LEVEL EXTRACTION & STRICT CONSISTENCY CHECK")
+    print("Requirement: completed (k6 + drain) + pending + failed == accepted for EVERY run")
+    print("=" * 90)
 
     trials = []
-    for jf in job_files:
-        basename = os.path.basename(jf).replace("_jobs.csv", "")
-        k6_f = os.path.join(RESULTS_DIR, f"{basename}_k6_raw.csv")
-        sys_f = os.path.join(RESULTS_DIR, f"{basename}_system.csv")
+    failures = 0
 
-        # Parse condition and load parameters
-        is_open_loop = False
-        rate_val = None
-
-        if basename.startswith("openloop_"):
-            is_open_loop = True
-            rest = basename[len("openloop_"):]
-            if rest.startswith("kafka_fixed1_"):
-                cond = "openloop_fixed1"
-                rest = rest[len("kafka_fixed1_"):]
-            elif rest.startswith("kafka_hpa_"):
-                cond = "openloop_hpa"
-                rest = rest[len("kafka_hpa_"):]
-            else:
-                continue
-            parts = rest.split("_")
-            # 2mb_{rate}rate_rep{r}_{ts}
-            mb = int(parts[0].replace("mb", ""))
-            rate_val = int(parts[1].replace("rate", ""))
-            vus = rate_val  # store rate in vus for grouping
-            rep = int(parts[2].replace("rep", ""))
-        elif basename.startswith("kafka_fixed1_"):
-            cond = "kafka_fixed1"
-            rest = basename[len("kafka_fixed1_"):]
-            parts = rest.split("_")
-            mb = int(parts[0].replace("mb", ""))
-            vus = int(parts[1].replace("vu", ""))
-            rep = int(parts[2].replace("rep", ""))
-        elif basename.startswith("kafka_hpa_"):
-            cond = "kafka_hpa"
-            rest = basename[len("kafka_hpa_"):]
-            parts = rest.split("_")
-            mb = int(parts[0].replace("mb", ""))
-            vus = int(parts[1].replace("vu", ""))
-            rep = int(parts[2].replace("rep", ""))
-        elif basename.startswith("sync_"):
-            cond = "sync"
-            rest = basename[len("sync_"):]
-            parts = rest.split("_")
-            mb = int(parts[0].replace("mb", ""))
-            vus = int(parts[1].replace("vu", ""))
-            rep = int(parts[2].replace("rep", ""))
-        else:
-            continue
+    for entry in manifest_entries:
+        run_id = entry["run_id"]
+        k6_f = os.path.join(RESULTS_DIR, f"{run_id}_k6_raw.csv")
+        jobs_f = os.path.join(RESULTS_DIR, f"{run_id}_jobs.csv")
+        sys_f = os.path.join(RESULTS_DIR, f"{run_id}_system.csv")
 
         up_p50, up_p95, req_202, req_503, k6_t0, k6_t1 = parse_k6_raw(k6_f)
-        job_p50, job_p95, comp_k6, comp_drain, pending_end, failed, t_c0, t_c1, drain_time = parse_jobs(jf, k6_t1)
+        job_p50, job_p95, comp_k6, comp_drain, pending_end, failed, t_c0, t_c1, drain_time, accepted = parse_jobs(jobs_f, k6_t1)
         max_reps, restarts, oom, min_free, min_avail, max_swap, ts_data = parse_system(sys_f)
 
         total_completed = comp_k6 + comp_drain
 
-        # Unambiguous Throughput Definition:
-        # Completions per minute over active processing interval (first created_at to last completed_at)
+        # STRICT CONSISTENCY CHECK
+        is_consistent = (total_completed + pending_end + failed == accepted)
+        if not is_consistent:
+            failures += 1
+            print(f"[CONSISTENCY FAIL] {run_id}: completed({total_completed}) + pending({pending_end}) + failed({failed}) != accepted({accepted})")
+            raise AssertionError(f"Consistency check failed for run {run_id}")
+        else:
+            print(f"[CONSISTENCY PASS] {run_id:<46} | accepted={accepted:<3} | k6_comp={comp_k6:<3} | drain_comp={comp_drain:<3} | drain_s={drain_time:<6.2f} | pend={pending_end} fail={failed}")
+
+        # Throughput definition for closed-loop: completions per minute over active window
         throughput = None
-        if total_completed > 0 and t_c0 and t_c1 and t_c1 > t_c0:
-            active_interval_sec = max(1.0, t_c1 - t_c0)
-            throughput = (total_completed / active_interval_sec) * 60.0
-        elif total_completed > 0 and k6_t0 and k6_t1 and k6_t1 > k6_t0:
-            active_interval_sec = max(1.0, k6_t1 - k6_t0) + drain_time
-            throughput = (total_completed / active_interval_sec) * 60.0
+        if not entry["is_open_loop"]:
+            if total_completed > 0 and t_c0 and t_c1 and t_c1 > t_c0:
+                active_interval_sec = max(1.0, t_c1 - t_c0)
+                throughput = (total_completed / active_interval_sec) * 60.0
+            elif total_completed > 0 and k6_t0 and k6_t1 and k6_t1 > k6_t0:
+                active_interval_sec = max(1.0, k6_t1 - k6_t0) + drain_time
+                throughput = (total_completed / active_interval_sec) * 60.0
 
         trials.append({
-            "run_id": basename,
-            "condition": cond,
-            "is_open_loop": is_open_loop,
-            "rate_per_min": rate_val,
-            "file_mb": mb,
-            "vus": vus,
-            "rep": rep,
+            "run_id": run_id,
+            "condition": entry["condition"],
+            "is_open_loop": entry["is_open_loop"],
+            "file_mb": entry["file_mb"],
+            "load_level": entry["load_level"],
+            "vus": entry["vus"],
+            "rep": entry["rep"],
+            "requests_accepted": accepted,
             "requests_202": req_202,
             "requests_503": req_503,
             "jobs_completed_k6": comp_k6,
@@ -305,22 +339,27 @@ def process_all_results():
             "min_vm_avail_mb": min_avail,
             "max_swap_used_mb": max_swap,
             "ts_data": ts_data,
+            "file_name": f"{run_id}_jobs.csv",
         })
 
+    print("-" * 90)
+    print(f"Consistency check complete: {len(trials)} runs verified, 0 failures.")
+    print("-" * 90)
     return trials
 
 
 def aggregate_summary(trials):
     groups = {}
     for t in trials:
-        key = (t["condition"], t["file_mb"], t["vus"])
+        key = (t["condition"], t["file_mb"], t["load_level"])
         groups.setdefault(key, []).append(t)
 
     summary_rows = []
     summary_dict = {}
 
-    for (cond, mb, vus), tr_list in sorted(groups.items()):
+    for (cond, mb, load_lvl), tr_list in sorted(groups.items()):
         runs_count = len(tr_list)
+        files_str = "; ".join(t["file_name"] for t in tr_list)
 
         def med_or_none(attr):
             vals = [t[attr] for t in tr_list if t[attr] is not None]
@@ -337,6 +376,7 @@ def aggregate_summary(trials):
         def sum_attr(attr):
             return sum(t[attr] for t in tr_list)
 
+        tot_accepted = sum_attr("requests_accepted")
         tot_202 = sum_attr("requests_202")
         tot_503 = sum_attr("requests_503")
         tot_comp_k6 = sum_attr("jobs_completed_k6")
@@ -353,13 +393,15 @@ def aggregate_summary(trials):
         job_p50_med = med_or_none("job_p50_sec")
         job_p95_med = med_or_none("job_p95_sec")
 
-        tp_med = med_or_none("throughput_jobs_min")
-        tp_min = min_or_none("throughput_jobs_min")
-        tp_max = max_or_none("throughput_jobs_min")
+        # In open-loop, throughput equals arrival rate; report N/A as requested
+        is_ol = "openloop" in cond
+        tp_med = None if is_ol else med_or_none("throughput_jobs_min")
+        tp_min = None if is_ol else min_or_none("throughput_jobs_min")
+        tp_max = None if is_ol else max_or_none("throughput_jobs_min")
 
         max_reps = max(t["max_replicas"] for t in tr_list)
-        tot_restarts = sum(t["restarts"] for t in tr_list)
-        tot_oom = sum(t["oom_killed"] for t in tr_list)
+        tot_restarts = max(t["restarts"] for t in tr_list)
+        tot_oom = max(t["oom_killed"] for t in tr_list)
         min_free = min((t["min_vm_free_mb"] for t in tr_list if t["min_vm_free_mb"] is not None), default=None)
         min_avail = min((t["min_vm_avail_mb"] for t in tr_list if t["min_vm_avail_mb"] is not None), default=None)
         max_swap = max(t["max_swap_used_mb"] for t in tr_list)
@@ -367,14 +409,15 @@ def aggregate_summary(trials):
         row = {
             "condition": cond,
             "file_mb": mb,
-            "load_level": f"{vus}rate" if "openloop" in cond else f"{vus}vu",
+            "load_level": load_lvl,
             "runs": runs_count,
-            "requests_202": tot_202,
-            "requests_503": tot_503,
-            "jobs_completed_k6": tot_comp_k6,
-            "jobs_completed_drain": tot_comp_drain,
-            "jobs_pending_end": tot_pending,
-            "jobs_failed": tot_failed,
+            "requests_accepted_total": tot_accepted,
+            "requests_202_total": tot_202,
+            "requests_503_total": tot_503,
+            "jobs_completed_k6_total": tot_comp_k6,
+            "jobs_completed_drain_total": tot_comp_drain,
+            "jobs_pending_end_total": tot_pending,
+            "jobs_failed_total": tot_failed,
             "drain_time_sec_median": fmt_val(med_drain, 2),
             "upload_p50_ms_median": fmt_val(up_p50_med, 2),
             "upload_p50_ms_min": fmt_val(up_p50_min, 2),
@@ -390,9 +433,11 @@ def aggregate_summary(trials):
             "min_vm_free_mb": fmt_val(min_free, 0),
             "min_vm_avail_mb": fmt_val(min_avail, 0),
             "max_swap_used_mb": max_swap,
+            "file_list": files_str,
         }
         summary_rows.append(row)
-        summary_dict[(cond, mb, vus)] = {
+        vus_val = tr_list[0]["vus"]
+        summary_dict[(cond, mb, vus_val)] = {
             "upload_p50": up_p50_med or 0.0,
             "upload_p95": up_p95_med or 0.0,
             "tp_med": tp_med or 0.0,
@@ -418,7 +463,7 @@ def generate_charts(summary_dict):
     plt.style.use("seaborn-v0_8-whitegrid" if "seaborn-v0_8-whitegrid" in plt.style.available else "default")
     os.makedirs(DOCS_IMG_DIR, exist_ok=True)
 
-    # Chart 1: Upload API Latency (Sync vs Kafka)
+    # Chart 1: Upload API Latency (Sync vs Kafka HPA)
     fig, ax = plt.subplots(figsize=(9, 5.5), dpi=300)
     x_labels = ["1 VU", "2 VUs", "4 VUs", "8 VUs", "10MB 1VU", "10MB 2VU"]
     x = np.arange(len(x_labels))
@@ -429,19 +474,19 @@ def generate_charts(summary_dict):
 
     for mb, vus in [(2, 1), (2, 2), (2, 4), (2, 8), (10, 1), (10, 2)]:
         s = summary_dict.get(("sync", mb, vus), {"upload_p50": 0, "upload_p95": 0})
-        k = summary_dict.get(("kafka_fixed1", mb, vus), {"upload_p50": 0, "upload_p95": 0})
+        k = summary_dict.get(("kafka_hpa", mb, vus), {"upload_p50": 0, "upload_p95": 0})
         sync_p50.append(s["upload_p50"])
         sync_p95.append(s["upload_p95"])
         kafka_p50.append(k["upload_p50"])
         kafka_p95.append(k["upload_p95"])
 
-    ax.bar(x - width/2, sync_p50, width, label="Sync Path p50 (Monolith analog)", color="#d9534f", alpha=0.85)
-    ax.bar(x + width/2, kafka_p50, width, label="Kafka Async Path p50 (Decoupled)", color="#0275d8", alpha=0.85)
+    ax.bar(x - width/2, sync_p50, width, label="Sync Path p50 (Monolith baseline)", color="#d9534f", alpha=0.85)
+    ax.bar(x + width/2, kafka_p50, width, label="Kafka Async Path p50 (Decoupled HPA)", color="#0275d8", alpha=0.85)
 
     ax.errorbar(x - width/2, sync_p50, yerr=[[0]*len(sync_p50), [max(0, p95-p50) for p50, p95 in zip(sync_p50, sync_p95)]], fmt='none', ecolor='#8b0000', capsize=4, label="Sync p95 tail")
     ax.errorbar(x + width/2, kafka_p50, yerr=[[0]*len(kafka_p50), [max(0, p95-p50) for p50, p95 in zip(kafka_p50, kafka_p95)]], fmt='none', ecolor='#00008b', capsize=4, label="Kafka p95 tail")
 
-    ax.set_title("Upload API Response Time: Sync vs Kafka Architecture", fontsize=14, fontweight="bold", pad=12)
+    ax.set_title("Upload API Response Time: Sync Monolith vs Kafka Architecture", fontsize=13, fontweight="bold", pad=12)
     ax.set_ylabel("Response Time (ms, log scale)", fontsize=11)
     ax.set_yscale("log")
     ax.set_xticks(x)
@@ -453,17 +498,15 @@ def generate_charts(summary_dict):
     plt.savefig(p1)
     plt.close()
 
-    # Chart 2: Throughput vs Load
+    # Chart 2: Closed-Loop Throughput vs Load (Sync vs Kafka HPA)
     fig, ax = plt.subplots(figsize=(9, 5.5), dpi=300)
     tp_sync = [summary_dict.get(("sync", mb, vus), {"tp_med": 0})["tp_med"] for mb, vus in [(2, 1), (2, 2), (2, 4), (2, 8), (10, 1), (10, 2)]]
-    tp_fixed = [summary_dict.get(("kafka_fixed1", mb, vus), {"tp_med": 0})["tp_med"] for mb, vus in [(2, 1), (2, 2), (2, 4), (2, 8), (10, 1), (10, 2)]]
     tp_hpa = [summary_dict.get(("kafka_hpa", mb, vus), {"tp_med": 0})["tp_med"] for mb, vus in [(2, 1), (2, 2), (2, 4), (2, 8), (10, 1), (10, 2)]]
 
-    ax.plot(x_labels, tp_sync, marker="s", color="#d9534f", linewidth=2.2, label="Sync Path (Monolith)")
-    ax.plot(x_labels, tp_fixed, marker="o", color="#0275d8", linewidth=2.2, label="Kafka Path (Fixed 1 Replica)")
+    ax.plot(x_labels, tp_sync, marker="s", color="#d9534f", linewidth=2.2, label="Sync Path (Monolith baseline)")
     ax.plot(x_labels, tp_hpa, marker="^", color="#5cb85c", linewidth=2.2, linestyle="--", label="Kafka Path + HPA (1-3 Replicas)")
 
-    ax.set_title("System Throughput: Jobs Completed per Minute", fontsize=14, fontweight="bold", pad=12)
+    ax.set_title("Closed-Loop System Throughput: Jobs Completed per Minute", fontsize=13, fontweight="bold", pad=12)
     ax.set_ylabel("Throughput (jobs / min)", fontsize=11)
     ax.set_xlabel("Concurrency / Workload", fontsize=11)
     ax.legend(frameon=True, loc="upper left", fontsize=10)
@@ -473,17 +516,14 @@ def generate_charts(summary_dict):
     plt.savefig(p2)
     plt.close()
 
-    # Chart 3: Replicas Over Time
+    # Chart 3: Replicas Over Time from new HPA suite
     fig, ax = plt.subplots(figsize=(9, 5.0), dpi=300)
-
-    def load_system_timeseries(condition_prefix):
-        files = glob.glob(os.path.join(RESULTS_DIR, f"{condition_prefix}_*system.csv"))
-        if not files:
-            return [], []
-        files.sort(key=lambda x: ("8vu" in x, "4vu" in x, "2vu" in x), reverse=True)
-        t_rel, replicas = [], []
+    # Target system file from new HPA suite showing scaling: kafka_hpa_2mb_8vu_rep3_1792486470_system.csv
+    hpa_sys_file = os.path.join(RESULTS_DIR, "kafka_hpa_2mb_8vu_rep3_1792486470_system.csv")
+    t_rel, replicas = [], []
+    if os.path.exists(hpa_sys_file):
         start_dt = None
-        with open(files[0], "r", encoding="utf-8", errors="ignore") as f:
+        with open(hpa_sys_file, "r", encoding="utf-8", errors="ignore") as f:
             reader = csv.DictReader(f)
             for row in reader:
                 ts_str = row.get("timestamp_utc")
@@ -500,17 +540,13 @@ def generate_charts(summary_dict):
                     replicas.append(int(row.get("ml_ready_replicas", 1)))
                 except ValueError:
                     replicas.append(1)
-        return t_rel, replicas
 
-    hpa_t, hpa_reps = load_system_timeseries("kafka_hpa")
-    fixed_t, fixed_reps = load_system_timeseries("kafka_fixed1")
+    if t_rel and replicas:
+        ax.step(t_rel, replicas, where="post", color="#5cb85c", linewidth=2.5, label="HPA Active Replicas (2MB 8VU Sustained Load)")
+        # Plot single replica baseline for contrast
+        ax.axhline(1.0, color="#0275d8", linewidth=1.8, linestyle=":", label="Fixed Allocation (1 Replica Baseline)")
 
-    if hpa_t and hpa_reps:
-        ax.step(hpa_t, hpa_reps, where="post", color="#5cb85c", linewidth=2.5, label="HPA Active Replicas")
-    if fixed_t and fixed_reps:
-        ax.step(fixed_t, fixed_reps, where="post", color="#0275d8", linewidth=2.0, linestyle=":", label="Fixed Allocation (1 Replica)")
-
-    ax.set_title("Kubernetes Horizontal Pod Autoscaling (HPA) Elasticity", fontsize=14, fontweight="bold", pad=12)
+    ax.set_title("Kubernetes Horizontal Pod Autoscaler (HPA) Elasticity", fontsize=13, fontweight="bold", pad=12)
     ax.set_ylabel("Ready Pod Replicas", fontsize=11)
     ax.set_xlabel("Time under Sustained Load (seconds)", fontsize=11)
     ax.set_ylim(0.5, 3.5)
@@ -524,6 +560,10 @@ def generate_charts(summary_dict):
 
     # Chart 4: Recovery Timeline from Pod-Kill Trials
     recovery_file = os.path.join(RESULTS_DIR, "ml_pod_recovery_trials.json")
+    if not os.path.exists(recovery_file):
+        recovery_file = os.path.join(DOCS_DIR, "data", "ml_pod_recovery_trials.json")
+
+    p4 = None
     if os.path.exists(recovery_file):
         with open(recovery_file, "r") as f:
             trials_json = json.load(f)
@@ -570,22 +610,50 @@ def generate_charts(summary_dict):
         p4 = os.path.join(RESULTS_DIR, "chart4_recovery_timeline.png")
         plt.savefig(p4)
         plt.close()
-    else:
-        p4 = None
 
     for p in [p1, p2, p3, p4]:
         if p and os.path.exists(p):
-            shutil.copyfile(p, os.path.join(DOCS_IMG_DIR, os.path.basename(p)))
-            print(f"[DOCS] Copied {os.path.basename(p)} -> docs/images/")
+            dest = os.path.join(DOCS_IMG_DIR, os.path.basename(p))
+            shutil.copyfile(p, dest)
+            print(f"[DOCS] Copied {os.path.basename(p)} -> {dest}")
+
+
+def print_open_loop_reps(trials):
+    ol_trials = [t for t in trials if t["is_open_loop"]]
+    print("\n" + "=" * 90)
+    print("OPEN-LOOP PER-REPETITION BREAKDOWN")
+    print("Metrics: Latency percentiles, backlog at k6 cutoff, and drain time per rep")
+    print("=" * 90)
+    print(f"{'Condition':<18} | {'Rate':<8} | {'Rep':<5} | {'Accepted':<8} | {'Comp(k6)':<8} | {'Backlog(Drain)':<14} | {'Drain(s)':<8} | {'p50(s)':<8} | {'p95(s)':<8}")
+    print("-" * 90)
+    for t in sorted(ol_trials, key=lambda x: (x["condition"], x["vus"], x["rep"])):
+        c = t["condition"]
+        r = t["vus"]
+        rep = t["rep"]
+        acc = t["requests_accepted"]
+        k6_c = t["jobs_completed_k6"]
+        dr_c = t["jobs_completed_drain"]
+        dr_s = t["drain_time_sec"]
+        p50 = t["job_p50_sec"] or 0.0
+        p95 = t["job_p95_sec"] or 0.0
+        print(f"{c:<18} | {r:<8} | {rep:<5} | {acc:<8} | {k6_c:<8} | {dr_c:<14} | {dr_s:<8.2f} | {p50:<8.3f} | {p95:<8.3f}")
+    print("=" * 90)
 
 
 def main():
-    trials = process_all_results()
+    manifest_entries = load_runs_from_manifests()
+    trials = process_manifest_runs(manifest_entries)
     summary_rows, summary_dict = aggregate_summary(trials)
-    out_csv = os.path.join(RESULTS_DIR, "benchmark_summary.csv")
-    write_summary_csv(summary_rows, out_csv)
+
+    # Write summary CSV to results/ and docs/
+    out_res_csv = os.path.join(RESULTS_DIR, "benchmark_summary.csv")
+    out_docs_csv = os.path.join(DOCS_DIR, "benchmark_summary.csv")
+    write_summary_csv(summary_rows, out_res_csv)
+    write_summary_csv(summary_rows, out_docs_csv)
+
+    print_open_loop_reps(trials)
     generate_charts(summary_dict)
-    print("\n[COMPLETE] Successfully regenerated summary table and charts from raw files.")
+    print("\n[COMPLETE] Successfully generated summary table and charts with strict consistency verification.")
 
 
 if __name__ == "__main__":
