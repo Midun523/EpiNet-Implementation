@@ -543,46 +543,42 @@ Conditions A1 and A2 are the same configuration (1.5 GB backend, 256M redo) yet 
 
 ---
 
-### How to Run the Kubernetes Stack
+## How to Reproduce
 
-#### 1. Prerequisites & Tool Installation
-- **Docker Desktop** running with WSL2 backend.
-- **kind** (Kubernetes in Docker, v0.27+):
-  * *Windows*: `winget install Kubernetes.kind` or `choco install kind` (or place `kind.exe` in `%USERPROFILE%\.local\bin` or user PATH — do not install into Docker Desktop's program directories).
-  * *macOS*: `brew install kind`
-  * *Linux*: `curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.27.0/kind-linux-amd64 && chmod +x ./kind && sudo mv ./kind /usr/local/bin/kind`
-- **kubectl** (Kubernetes CLI, v1.30+):
-  * *Windows*: `winget install Kubernetes.kubectl` or `choco install kubernetes-cli` (or enabled via Docker Desktop Kubernetes settings).
-  * *macOS*: `brew install kubectl`
-  * *Linux*: `curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" && chmod +x kubectl && sudo mv kubectl /usr/local/bin/`
+### Prerequisites
+- **Docker Desktop** (v4.30+) with WSL2 engine enabled (Windows) or native Docker daemon (Linux/macOS).
+- **kind** (v0.27+): Kubernetes in Docker CLI.
+- **kubectl** (v1.30+): Kubernetes command-line tool.
+- **k6** (v0.50+): Load testing tool (executed via container image `grafana/k6:latest`).
+- **Python** (3.10+): With required test dependencies (`pip install numpy matplotlib requests`).
 
-#### 2. Start Compose Infrastructure & Create Kind Cluster
+### Exact Reproduction Commands in Order
+
 ```bash
-# Start MySQL and Kafka in compose
+# 1. Start backing compose services (MySQL 8 and Apache Kafka broker)
 docker compose up -d mysql kafka
 
-# Stop unneeded services to conserve memory
+# 2. Stop compose app containers to prevent port collisions and conserve VM memory
 docker compose stop backend ml-service frontend prometheus grafana kafka-exporter
 
-# Create kind cluster from repository config
+# 3. Create kind cluster with dual host/container port mappings
 kind create cluster --config k8s/kind-config.yaml
 
-# Pre-load local Docker images into kind node
+# 4. Build local application container images
 docker build -t epinet-backend:latest ./backend
 docker build -t epinet-ml-service:latest ./ml-service
 docker build -t epinet-frontend:latest ./frontend
-kind load docker-image epinet-backend:latest epinet-ml-service:latest epinet-frontend:latest --name epinet-cluster
-```
 
-#### 3. Deploy Metrics-Server & Application Manifests
-```bash
-# Install metrics-server with insecure TLS for kind
+# 5. Pre-load local Docker images into kind cluster node
+kind load docker-image epinet-backend:latest epinet-ml-service:latest epinet-frontend:latest --name epinet-cluster
+
+# 6. Deploy metrics-server with insecure TLS for kind scraping
 kubectl apply -f k8s/metrics-server.yaml
 
-# Generate secret.yaml and template deployment manifests with discovered kind gateway IP
+# 7. Discover kind network gateway IP and template secrets and deployment manifests
 python k8s/generate-secrets.py
 
-# Apply ConfigMap, Secrets, Deployments, Services, and HPAs
+# 8. Apply all Kubernetes manifests (ConfigMap, Secret, Deployments, Services, and HPAs)
 kubectl apply -f k8s/configmap.yaml \
               -f k8s/secret.yaml \
               -f k8s/backend-deployment.yaml \
@@ -590,26 +586,29 @@ kubectl apply -f k8s/configmap.yaml \
               -f k8s/frontend-deployment.yaml \
               -f k8s/hpa.yaml
 
-# Verify all pods are Ready
+# 9. Verify all pods reach Ready status
+kubectl rollout status deployment/backend --timeout=120s
+kubectl rollout status deployment/ml-service --timeout=120s
+kubectl rollout status deployment/frontend --timeout=120s
 kubectl get pods -o wide
+
+# 10. Execute benchmark suites (closed-loop and open-loop matrix)
+python tests/bench/run_matrix.py
+python tests/bench/run_hpa_and_openloop.py
+
+# 11. Extract trial metrics, verify strict consistency, and generate publication summary & charts
+python tests/bench/generate_summary_and_charts.py
 ```
 
-#### 4. Run End-to-End & Resilience Tests
-```bash
-# Verify 40 MB upload through cluster NodePort 30080
-python scratch/verify_k8s_40mb.py
+### What This Project Demonstrates and What It Does Not
 
-# Run HPA scale-out load test
-python scratch/test_k8s_load_hpa.py
+**What this project demonstrates:**
+This project empirically demonstrates that decoupling high-overhead analytical computation via an event-driven architecture (Apache Kafka message bus with manual partition offset commits) prevents synchronous HTTP worker thread exhaustion under burst concurrency, returning HTTP 202 in 90–520 ms without dropped requests (0 HTTP 503 rejections vs 199 in the synchronous thread-pool baseline). It proves that Kubernetes Horizontal Pod Autoscaling (HPA) dynamically scales consumer worker pods from 1 to 3 replicas under sustained CPU utilization (>60%), and that uncommitted partition offsets guarantee resilient mid-job pod recovery and completion with zero data loss following unexpected worker pod termination.
 
-# Run mid-job pod deletion resilience test
-python scratch/test_pod_recovery_3trials.py
+**What this project does not demonstrate:**
+This project is **not** a distributed multi-node cloud production benchmark (all tests ran within a single kind node on a single physical laptop under WSL2 virtualization); it does **not** evaluate inter-node networking, availability-zone latency, or distributed storage attachments. It does **not** establish an empirical or theoretical throughput ceiling for a single worker under concurrent closed-loop load. It does **not** identify the root causes of client-side upload stalls at 8 VUs or intermittent multi-second worker freezes, which were uninstrumented by OS-level profiling. Finally, all biological interaction matrices ($\Delta R^2$) and pharmacogenomic schemas are computed on synthetic datasets without clinical or pharmacological efficacy validation.
 
-# Run complete 6-scenario validation suite against Kubernetes
-python tests/e2e/run_e2e_tests.py --k8s
-```
-
-#### 5. Empirical Pod Resilience Findings (Single-Replica forced deletion)
+#### Empirical Pod Resilience Findings (Single-Replica forced deletion)
 Under single-replica execution (HPAs removed, 1 replica pinned):
 - **Backend Pod Kill Mid-Job**: Replacement pod reaches Ready in ~31.8s. The ML worker retries fetching from backend with exponential backoff up to `TRANSIENT_RETRY_TIMEOUT_SECONDS=600s`. Once backend completes cold start, ML worker fetches data and finishes job in ~2.1s without dropping the job or restarting.
 - **ML-Service Pod Kill Mid-Job**: Replacement pod reaches Ready in ~11.7–13.0s (`initialDelaySeconds: 10` probe). Because Kafka offsets are committed manually only *after* successful result write-back and publish, the replacement worker resumes consumption of the uncommitted event and completes the in-flight analysis within ~3.0–5.2s from kill (processing completes while the pod probe is still finishing initialization).
@@ -631,10 +630,10 @@ Raw per-request latencies, per-job database records, and system timeseries are p
   - `results/hpa_openloop_manifest_1792484863.json`: 30 runs (18 kafka_hpa closed-loop, 12 open-loop) $\times$ 3 files = **90 raw CSV data files**.
   - Total Manifest Data Files: **252 raw CSV files** across 84 runs.
 - **Zip Archive Contents (`docs/data/raw_benchmark_results.zip`)**:
-  - Total Entries: **263 files**.
-  - Breakdown: 252 raw trial CSVs + 2 manifest JSONs + 1 pod recovery trial JSON (`ml_pod_recovery_trials.json`) + 2 summary CSV copies (`benchmark_summary.csv` at root and in `results/`) + 2 e2e test log files (`e2e_k8s_*.log`) + 4 rendered chart PNG images (`chart1` to `chart4`).
-- **Explanation of Archive Size Doubling**:
-  The zip archive grew from 565,499 bytes (~552 KB) in commit `44a840a` to 1,119,484 bytes (~1.07 MB) in commit `6d8c2f2`. This size doubling was caused entirely by bundling the 4 high-resolution rendered PNG image charts (`chart1_response_time_vs_load.png` 120 KB, `chart2_throughput_vs_load.png` 174 KB, `chart3_replicas_over_time.png` 120 KB, and `chart4_recovery_timeline.png` 135 KB), which together contribute ~549 KB of pre-compressed binary data to the archive.
+  - Total Entries: **259 files** (~561 KB / 574,598 bytes).
+  - Breakdown: 252 raw trial CSVs + 2 manifest JSONs + 1 pod recovery trial JSON (`ml_pod_recovery_trials.json`) + 2 e2e test log files (`e2e_k8s_final.log` and `e2e_k8s_1792503638.log`) + 2 summary CSV copies (`benchmark_summary.csv` at root and under `results/`).
+  - **Difference from Earlier 257 Entries**:
+    The earlier archive in commit `44a840a` held 257 entries. The current archive holds 259 entries (+2 files) due to the addition of the timestamped Kubernetes e2e log (`results/e2e_k8s_1792503638.log`) and the duplicate path entry `results/benchmark_summary.csv`. The 4 chart PNGs were removed from the zip archive as they already reside in `docs/images/`, restoring the zip file size from ~1.12 MB to ~561 KB.
 
 ### Suite Wall Time & Operational Breakdown
 - **Full Closed-Loop Suite Wall Time**: Measured directly from first cell start timestamp (`1792477774` / 06:29:34 UTC) to last cell completion timestamp (`1792482426` / 07:47:06 UTC), the total wall clock execution was **4,652.13 seconds (77.54 minutes)**.
@@ -668,13 +667,17 @@ Raw per-request latencies, per-job database records, and system timeseries are p
 > - **Expected Duration to Re-run Sync**: Re-running the 18 sync cells under the HPA schedule with a 600-second drain cap would require an expected duration of **~21.0 minutes** ($18\text{ cells} \times \sim 70\text{ s}$). Because sync was not re-run under this identical schedule, head-to-head comparative throughput and latency claims between sync and Kafka are withheld.
 
 ### Metric Definitions & Aggregation Standards
+- **Reconciliation of Run Counts (84 Raw vs 48 Candidate vs 47 Verified)**:
+  - **84 Raw Runs Executed**: Total test executions recorded in raw result files across both manifests: 54 closed-loop runs in `bench_manifest_1792477680.json` (18 sync, 18 kafka_fixed1, 18 kafka_hpa) and 30 runs in `hpa_openloop_manifest_1792484863.json` (18 kafka_hpa closed-loop, 12 open-loop).
+  - **48 Candidate Runs Evaluated**: The subset loaded by `generate_summary_and_charts.py` for comparative evaluation: 18 sync baseline runs from Manifest 1, 18 kafka_hpa closed-loop runs from Manifest 2, and 12 open-loop runs (6 fixed1, 6 hpa) from Manifest 2. (The 18 closed-loop fixed-1 runs from Manifest 1 were dropped due to the 45 s drain cap censoring difference, and Manifest 1 HPA was superseded by Manifest 2).
+  - **47 Verified Benchmark Runs Reported**: The final validated trials published in `docs/benchmark_summary.csv` and `docs/benchmark_per_run.csv`. From the 48 candidate runs, exactly 1 run was excluded (`kafka_hpa_2mb_4vu_rep2_1792485786` because `ml-service` initialized with 3 ready replicas instead of 1, invalidating the baseline).
 - **Source of Truth**: All rows in the summary table are built from explicit file lists defined in the suite manifests (`bench_manifest_1792477680.json` and `hpa_openloop_manifest_1792484863.json`), eliminating file-glob collisions.
 - **Non-Tautological Per-Run Consistency Check**: In MySQL, `status` is partitioned across `COMPLETED`, `PENDING`/`PROCESSING`/`UPLOADED`, and `FAILED`; therefore, `len(job_rows) == comp + pend + fail` is an internal identity. To prevent circular reasoning, every run compares client-side k6 HTTP receipts against database records: $\text{DB Rows Created} \text{ vs } (\text{k6 HTTP 202} + \text{k6 HTTP 503})$.
 - **Naming Standard**: In sync mode, task rejections from a saturated `@Async` queue create a database row before marking it `FAILED` and returning HTTP 503. To avoid misleading terminology, the column is named **`DB Rows Created`**, keeping HTTP 202 and HTTP 503 counts distinct.
 - **HPA 2MB 4VU Rep 2 Excluded**: In Rep 2 (`kafka_hpa_2mb_4vu_rep2_1792485786`), `ml-service` initialized with 3 ready replicas (`replicas_start: 3`) rather than 1. This invalid baseline cell is excluded, leaving `Runs: 2` (Reps 1 & 3) in the summary table.
 - **Totals vs Medians**: Counts (`db_rows_created_total`, `k6_http_202_total`, `k6_http_503_total`, `jobs_completed_k6_total`, `jobs_completed_drain_total`, `jobs_pending_end_total`, `jobs_failed_total`) are reported as totals summed across valid runs. Latencies (`upload_p50_ms_median`, `job_p50_sec_median`, `drain_time_sec_median`) are reported as medians across runs.
-- **Explanation of `pod_restarts_max = 1` Across Kafka Rows**: In [`docs/benchmark_summary.csv`](docs/benchmark_summary.csv), `pod_restarts_max = 1` for all Kafka rows (`kafka_hpa` and `openloop`), while sync rows report `0`. This reflects a pre-existing cumulative `restartCount: 1` on the `ml-service` pod present at the start of the second suite (`hpa_openloop_suite`, starting at 08:27:47 UTC), inherited from the inter-suite interval during e2e resilience testing and Docker Desktop restart. When `SystemMonitor` polled `kubectl get pods -l app=ml-service`, `restartCount: 1` was already recorded at $t=0$ and remained static at 1 throughout every subsequent HPA and open-loop run. Zero new pod crashes or restarts occurred during any active benchmark cell.
-- **Note on Upload Stalls in High-Load Medians**: In `kafka_hpa 2MB 8VU`, only 17 and 19 uploads were accepted during the 30 s window in Rep 1 and Rep 2, compared to 125 in Rep 3. Similarly, in `10MB 2VU`, runs accepted only 12, 20, and 4 uploads. Because these medians are dominated by client-side upload stalls (ingress connection contention / Tomcat buffer saturation), throughput trends in these cells do **not** reflect worker scaling behaviour.
+- **Explanation of `pod_restarts_max = 1` Across Kafka Rows**: In [`docs/benchmark_summary.csv`](docs/benchmark_summary.csv), `pod_restarts_max = 1` for all Kafka rows (`kafka_hpa` and `openloop`), while sync rows report `0`. This reflects a pre-existing restartCount=1, origin not verified (e2e tests scale/delete ml-service pods; a Docker Desktop relaunch also occurred). When `SystemMonitor` polled `kubectl get pods -l app=ml-service`, `restartCount: 1` was already recorded at $t=0$ and remained static at 1 throughout every subsequent HPA and open-loop run. Zero new pod crashes or restarts occurred during any active benchmark cell.
+- **Note on Upload Stalls in High-Load Medians**: In `kafka_hpa 2MB 8VU`, only 17 and 19 uploads were accepted during the 30 s window in Rep 1 and Rep 2, compared to 125 in Rep 3. Similarly, in `10MB 2VU`, runs accepted only 12, 20, and 4 uploads. Because these medians are dominated by client-side upload stalls (cause not established), throughput trends in these cells do **not** reflect worker scaling behaviour.
 
 ### Summary Benchmark Table
 The complete metrics across conditions, file sizes, and load levels (medians and totals across repetitions):
@@ -820,7 +823,7 @@ Timestamp inspection of per-job execution logs reveals intermittent multi-second
 ![Throughput vs Load](docs/images/chart2_throughput_vs_load.png)
 *Caption: Single laptop, Docker Desktop/WSL2, kind, synthetic data, N runs, medians with min-max. Note: Sync and Kafka suites were executed under different schedules and drain caps and are not directly comparable.*
 
-- **Upload Stalls Dominating High-Load Medians**: In `kafka_hpa 2MB 8VU`, only 17 and 19 uploads were accepted during the 30 s window in Rep 1 and Rep 2, compared to 125 in Rep 3. Similarly, in `10MB 2VU`, runs accepted only 12, 20, and 4 uploads. Because these medians are dominated by client-side upload stalls (Tomcat/connection ingress bottlenecks), throughput trends in these cells do **not** reflect worker scaling behaviour.
+- **Upload Stalls Dominating High-Load Medians**: In `kafka_hpa 2MB 8VU`, only 17 and 19 uploads were accepted during the 30 s window in Rep 1 and Rep 2, compared to 125 in Rep 3. Similarly, in `10MB 2VU`, runs accepted only 12, 20, and 4 uploads. Because these medians are dominated by client-side upload stalls (cause not established), throughput trends in these cells do **not** reflect worker scaling behaviour.
 - **Sync Baseline**: Ingestion throughput degrades under concurrency due to bounded executor queue rejections (HTTP 503), plateauing at ~24–38 completed jobs/min.
 
 ### 3. Horizontal Pod Autoscaler Dynamics
@@ -849,7 +852,7 @@ Measured across 3 single-clock trials on a 35 MB compute payload (`DEMO_COMPUTE_
   - `frontend`: 128 MiB limit (`k8s/frontend-deployment.yaml`).
   - Supporting infrastructure: MySQL (~780 MiB), Kafka broker (~600 MiB), Kind control plane (~600 MiB).
   - Theoretical total maximum committed budget: **5,692 MiB** (~5.56 GiB).
-- **Physical Memory**: On the 7,751 MiB host VM, measured `MemAvailable` remained between **2,442 MiB and 4,070 MiB** across all conditions. Free RAM was 62–83 MB because Linux buffers disk I/O in the page cache. Swap usage remained stable at **45–148 MiB** (HPA) and **664–694 MiB** (Sync) with 0 OOM kills across the entire matrix. No pods crashed or restarted during any active benchmark run. (As noted above, `pod_restarts_max=1` across all Kafka summary rows reflects the `ml-service` pod's pre-existing cumulative `restartCount` inherited from the inter-suite interval).
+- **Physical Memory**: On the 7,751 MiB host VM, measured `MemAvailable` remained between **2,442 MiB and 4,070 MiB** across all conditions. Free RAM was 62–83 MB because Linux buffers disk I/O in the page cache. Swap usage remained stable at **45–148 MiB** (HPA) and **664–694 MiB** (Sync) with 0 OOM kills across the entire matrix. No pods crashed or restarted during any active benchmark run. (As noted above, `pod_restarts_max=1` across all Kafka summary rows reflects a pre-existing restartCount=1, origin not verified (e2e tests scale/delete ml-service pods; a Docker Desktop relaunch also occurred)).
 
 ### Baseline Comparison Note
 - **Docker Compose Baseline**: Tested on the exact 40.00 MB / 41,942,992-byte dataset (377,864 rows), ML compute duration is **3.79 s median** (3.51s–4.79s across runs) when thread-constrained (`OMP_NUM_THREADS=1`). The earlier ~13.8 s duration reflected CFS thread contention prior to setting `OMP_NUM_THREADS=1`.
@@ -857,6 +860,7 @@ Measured across 3 single-clock trials on a 35 MB compute payload (`DEMO_COMPUTE_
 ### What Was NOT Established
 - **Closed-Loop Single-Worker Ceiling**: The theoretical or empirical throughput ceiling of a single worker under concurrent closed-loop load is **not established** (component breakdown times were estimates rather than direct measurements, and open-loop fixed1 rep 3 demonstrated 0.2 s turnaround on one worker).
 - **Processing Stalls & Freezes Root Cause**: The root cause of the multi-second processing gaps (e.g. the 58.25 s freeze in `openloop_hpa 60/min rep2`) was **not established**. Telemetry covered only part of the freeze window (up to 09:05:08 vs freeze ending at 09:05:40), consumer-group rebalances can occur without replica changes, and container/broker logs were not retained.
+- **High-Load Upload Stalls Root Cause**: In high-load cells (such as `kafka_hpa 2MB 8VU` and `10MB 2VU`), client-side upload stalls caused accepted uploads to drop severely in some repetitions (e.g. 17 and 19 vs 125 uploads). The root cause was **not established** (whether caused by Tomcat/connection buffer contention, socket exhaustion, or Docker bridge networking contention; neither client connection metrics nor backend thread dumps were recorded).
 - **Upload Duration Variance in 40 MB Iterations**: In e2e large-file testing, upload times varied between 5.5s, 28.5s, and 23.9s. The hypothesis that Tomcat multipart buffering was the sole bottleneck was **not established** (per-stage server timing lines for `csv_validate` and `db_insert` were not instrumented for those specific client iterations).
 - **Trial 2 Replacement Container Startup Delay**: The root cause of the 11.2s delay between pod creation and container start in Trial 2 was **not established** (cgroup cleanup vs network teardown timestamps were not recorded).
 - **HPA 8-Client Upload Latency Contention**: Whether latency spikes at 8 VUs were caused by cold InnoDB buffer pools, kind control plane API throttling, or Docker socket overhead was **not established** (no kernel/InnoDB lock instrumentation was attached).
