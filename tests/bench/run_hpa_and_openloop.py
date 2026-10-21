@@ -85,6 +85,28 @@ def get_ml_replicas():
         return 0
 
 
+def get_kafka_consumer_lag():
+    out, err, code = run_cmd([
+        "docker", "exec", "epinet-kafka",
+        "/opt/kafka/bin/kafka-consumer-groups.sh",
+        "--bootstrap-server", "localhost:9092",
+        "--describe", "--group", "epinet-ml-workers"
+    ])
+    if code != 0 or not out:
+        return "N/A (docker offline)"
+    total_lag = 0
+    found = False
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 6 and parts[0] == "epinet-ml-workers":
+            try:
+                total_lag += int(parts[5])
+                found = True
+            except (ValueError, IndexError):
+                pass
+    return total_lag if found else 0
+
+
 class SystemMonitor(threading.Thread):
     def __init__(self, run_id: str, interval_sec: float = 2.0):
         super().__init__()
@@ -400,7 +422,9 @@ def run_openloop_suite(duration=30):
 
     for rep in range(1, reps + 1):
         for cond in conditions:
-            # Set up condition
+            # Explicit state reset between conditions
+            print(f"\n[CONDITION SETUP] Resetting state for condition: {cond}")
+            truncate_db()
             if cond == "kafka_fixed1":
                 run_cmd(["kubectl", "set", "env", "deployment/backend", "ANALYSIS_MODE=kafka"])
                 run_cmd(["kubectl", "delete", "hpa", "ml-service-hpa", "--ignore-not-found=true"])
@@ -420,7 +444,8 @@ def run_openloop_suite(duration=30):
                     reset_hpa_to_single_replica()
 
                 rep_start = get_ml_replicas()
-                print(f"  -> Replicas at cell start: {rep_start}")
+                lag_start = get_kafka_consumer_lag()
+                print(f"  -> Replicas at cell start: {rep_start} | Kafka Consumer Lag: {lag_start}")
 
                 truncate_db()
                 monitor = SystemMonitor(run_id=run_id)

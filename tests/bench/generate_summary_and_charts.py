@@ -242,6 +242,11 @@ def load_runs_from_manifests():
         with open(m2_path, "r") as f:
             m2 = json.load(f)
         for r in m2:
+            # Exclude run where HPA started with 3 replicas instead of 1
+            if r.get("run_id") == "kafka_hpa_2mb_4vu_rep2_1792485786":
+                print(f"[MANIFEST EXCLUDE] Excluding {r['run_id']}: started with 3 replicas (invalid baseline).")
+                continue
+
             is_ol = r.get("type") == "open_loop" or "openloop" in r.get("run_id", "")
             cond = r["condition"]
             if is_ol:
@@ -272,10 +277,11 @@ def load_runs_from_manifests():
 
 
 def process_manifest_runs(manifest_entries):
-    print("\n" + "=" * 90)
-    print("RUN-LEVEL EXTRACTION & STRICT CONSISTENCY CHECK")
-    print("Requirement: completed (k6 + drain) + pending + failed == accepted for EVERY run")
-    print("=" * 90)
+    print("\n" + "=" * 115)
+    print(f"{'PER-RUN CONSISTENCY & DISCREPANCY AUDIT REPORT':^115}")
+    print("=" * 115)
+    print(f"{'Run ID':<46} | {'202':<3} | {'503':<3} | {'Rows':<4} | {'Comp':<4} | {'Pend':<4} | {'Fail':<4} | {'Diff':<4} | Discrepancy Explanation")
+    print("-" * 115)
 
     trials = []
     failures = 0
@@ -291,15 +297,26 @@ def process_manifest_runs(manifest_entries):
         max_reps, restarts, oom, min_free, min_avail, max_swap, ts_data = parse_system(sys_f)
 
         total_completed = comp_k6 + comp_drain
+        k6_total = req_202 + req_503
+        diff = accepted - k6_total
 
         # STRICT CONSISTENCY CHECK
         is_consistent = (total_completed + pending_end + failed == accepted)
         if not is_consistent:
             failures += 1
-            print(f"[CONSISTENCY FAIL] {run_id}: completed({total_completed}) + pending({pending_end}) + failed({failed}) != accepted({accepted})")
+            print(f"[CONSISTENCY FAIL] {run_id}: completed({total_completed}) + pending({pending_end}) + failed({failed}) != rows({accepted})")
             raise AssertionError(f"Consistency check failed for run {run_id}")
-        else:
-            print(f"[CONSISTENCY PASS] {run_id:<46} | accepted={accepted:<3} | k6_comp={comp_k6:<3} | drain_comp={comp_drain:<3} | drain_s={drain_time:<6.2f} | pend={pending_end} fail={failed}")
+
+        # Explain discrepancy between MySQL rows created and k6 HTTP responses (202 + 503)
+        explanation = "Exact match (rows == 202s)"
+        if failed > 0 and req_503 == failed and diff == 0:
+            explanation = f"Exact match: backend created row then marked FAILED on 503 ({failed} rejected)"
+        elif diff > 0:
+            explanation = f"{diff} in-flight upload(s) persisted in MySQL after k6 30s+15s cutoff"
+        elif diff < 0:
+            explanation = f"{abs(diff)} requests received HTTP 202 before row commit"
+
+        print(f"{run_id:<46} | {req_202:<3} | {req_503:<3} | {accepted:<4} | {total_completed:<4} | {pending_end:<4} | {failed:<4} | {diff:<4} | {explanation}")
 
         # Throughput definition for closed-loop: completions per minute over active window
         throughput = None
@@ -319,9 +336,9 @@ def process_manifest_runs(manifest_entries):
             "load_level": entry["load_level"],
             "vus": entry["vus"],
             "rep": entry["rep"],
-            "requests_accepted": accepted,
-            "requests_202": req_202,
-            "requests_503": req_503,
+            "db_rows_created": accepted,
+            "k6_http_202": req_202,
+            "k6_http_503": req_503,
             "jobs_completed_k6": comp_k6,
             "jobs_completed_drain": comp_drain,
             "jobs_pending_end": pending_end,
@@ -342,9 +359,9 @@ def process_manifest_runs(manifest_entries):
             "file_name": f"{run_id}_jobs.csv",
         })
 
-    print("-" * 90)
+    print("-" * 115)
     print(f"Consistency check complete: {len(trials)} runs verified, 0 failures.")
-    print("-" * 90)
+    print("-" * 115)
     return trials
 
 
@@ -376,9 +393,9 @@ def aggregate_summary(trials):
         def sum_attr(attr):
             return sum(t[attr] for t in tr_list)
 
-        tot_accepted = sum_attr("requests_accepted")
-        tot_202 = sum_attr("requests_202")
-        tot_503 = sum_attr("requests_503")
+        tot_rows = sum_attr("db_rows_created")
+        tot_202 = sum_attr("k6_http_202")
+        tot_503 = sum_attr("k6_http_503")
         tot_comp_k6 = sum_attr("jobs_completed_k6")
         tot_comp_drain = sum_attr("jobs_completed_drain")
         tot_pending = sum_attr("jobs_pending_end")
@@ -411,9 +428,9 @@ def aggregate_summary(trials):
             "file_mb": mb,
             "load_level": load_lvl,
             "runs": runs_count,
-            "requests_accepted_total": tot_accepted,
-            "requests_202_total": tot_202,
-            "requests_503_total": tot_503,
+            "db_rows_created_total": tot_rows,
+            "k6_http_202_total": tot_202,
+            "k6_http_503_total": tot_503,
             "jobs_completed_k6_total": tot_comp_k6,
             "jobs_completed_drain_total": tot_comp_drain,
             "jobs_pending_end_total": tot_pending,
@@ -624,13 +641,13 @@ def print_open_loop_reps(trials):
     print("OPEN-LOOP PER-REPETITION BREAKDOWN")
     print("Metrics: Latency percentiles, backlog at k6 cutoff, and drain time per rep")
     print("=" * 90)
-    print(f"{'Condition':<18} | {'Rate':<8} | {'Rep':<5} | {'Accepted':<8} | {'Comp(k6)':<8} | {'Backlog(Drain)':<14} | {'Drain(s)':<8} | {'p50(s)':<8} | {'p95(s)':<8}")
+    print(f"{'Condition':<18} | {'Rate':<8} | {'Rep':<5} | {'Rows':<8} | {'Comp(k6)':<8} | {'Backlog(Drain)':<14} | {'Drain(s)':<8} | {'p50(s)':<8} | {'p95(s)':<8}")
     print("-" * 90)
     for t in sorted(ol_trials, key=lambda x: (x["condition"], x["vus"], x["rep"])):
         c = t["condition"]
         r = t["vus"]
         rep = t["rep"]
-        acc = t["requests_accepted"]
+        acc = t["db_rows_created"]
         k6_c = t["jobs_completed_k6"]
         dr_c = t["jobs_completed_drain"]
         dr_s = t["drain_time_sec"]

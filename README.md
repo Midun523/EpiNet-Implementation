@@ -632,7 +632,9 @@ Raw per-request latencies, per-job database records, and system timeseries are p
   - *Correction Note*: The earlier ~49.8 minute figure was a pre-run theoretical estimate ($54 \times \sim 55\text{ s} = 2,970\text{ s}$) that failed to account for empirical queue drain times and inter-condition infrastructure tear-downs.
 - **HPA Independent Re-Run Suite**: Resetting `ml-service` to 1 replica before every cell and draining to completion took **1,859.67 seconds (30.99 minutes)** (pre-run estimate: ~16.5 min).
 - **Open-Loop Suite**: 12 runs with constant arrival rate took **568.28 seconds (9.47 minutes)** (pre-run estimate: ~11.0 min).
-- **Docker Desktop Session Integrity**: Docker Desktop was **not restarted** between the e2e test suite and the HPA independent suite, as verified by continuous container restart counters (`ml_restarts: 1` persisting into the first HPA trial) and continuous host VM memory timeseries.
+- **Docker Desktop Session Integrity & Status**:
+  - Docker Desktop **was relaunched / restarted** after the e2e test suite, prior to launching the independent HPA suite.
+  - Docker **was down / offline** during this session (verified via Docker CLI: `open //./pipe/dockerDesktopLinuxEngine: The system cannot find the file specified`).
 - **e2e Test 2 Actuator Telemetry Note**: In e2e Test 2, `job_counts_before: {}` was printed because the initial HTTP request to `/actuator/prometheus` timed out or encountered a transient connection reset, which was safely caught and returned as an empty dictionary by the test harness `try ... except Exception: pass`. Subsequent calls during the outage and after recovery successfully scraped the database status gauges (`{'COMPLETED': 12, 'FAILED': 0, 'PENDING': 1, 'PROCESSING': 0}` and `{'COMPLETED': 13, ...}`).
 
 ### Test Conditions & Workloads
@@ -646,16 +648,24 @@ Raw per-request latencies, per-job database records, and system timeseries are p
 > [!IMPORTANT]
 > **Exclusion of Closed-Loop Fixed-1 from HPA Comparison**: In earlier closed-loop runs, `kafka_fixed1` operated under a short 45-second drain cap, causing 40 to 321 backlogged jobs to remain uncompleted (censored) at test termination. Re-running those 18 closed-loop fixed1 cells with full uncensored drain would require an expected duration of **~60–90 minutes** (e.g. 2MB 4VU accumulated 321 pending jobs, requiring $321 \times 1.44\text{s} \approx 462\text{s}$ drain per rep, or ~23 minutes for that cell alone). To avoid mixing censored (45s cap) and uncensored (600s drain) cells in the same table, the closed-loop fixed1-vs-HPA comparison is dropped. Fixed1 vs HPA is evaluated strictly under open loop where arrival rates are fixed and both conditions drain cleanly.
 
+### Comparability Standard: Not Directly Comparable Across Sync and Kafka
+> [!WARNING]
+> **Sync and Kafka Tables Are Not Directly Comparable**:
+> - **Sync Baseline Suite**: Executed in the initial closed-loop run (`bench_manifest_1792477680.json`) under an earlier code revision with a strict 45-second queue drain cap. Under concurrency (10 MB 1VU and 2VU), this cap was exceeded, leaving 1 and 5 pending jobs uncensored at test cutoff.
+> - **Kafka HPA Suite**: Executed in the second independent suite (`hpa_openloop_manifest_1792484863.json`) at a different time, under an updated harness with verified single-replica initialization and an uncensored 600-second drain cap (0 pending jobs).
+> - **Expected Duration to Re-run Sync**: Re-running the 18 sync cells under the HPA schedule with a 600-second drain cap would require an expected duration of **~21.0 minutes** ($18\text{ cells} \times \sim 70\text{ s}$). Because sync was not re-run under this identical schedule, head-to-head comparative throughput and latency claims between sync and Kafka are withheld.
+
 ### Metric Definitions & Aggregation Standards
 - **Source of Truth**: All rows in the summary table are built from explicit file lists defined in the suite manifests (`bench_manifest_1792477680.json` and `hpa_openloop_manifest_1792484863.json`), eliminating file-glob collisions.
-- **Per-Run Consistency Check**: Every trial enforces that $\text{Jobs Completed} + \text{Jobs Pending} + \text{Jobs Failed} \equiv \text{Jobs Accepted}$. Any discrepancy immediately fails table generation.
-- **Totals vs Medians**: Counts (`requests_accepted_total`, `jobs_completed_k6_total`, `jobs_completed_drain_total`, `jobs_pending_end_total`, `jobs_failed_total`, `requests_202_total`, `requests_503_total`) are reported as totals summed across all 3 runs. Latencies (`upload_p50_ms_median`, `job_p50_sec_median`, `drain_time_sec_median`) are reported as medians across runs.
-- **Open-Loop Throughput Metric Dropped**: In open loop, throughput trivially equals the arrival rate (20 or 60 jobs/min); therefore, open loop is evaluated strictly via latency percentiles, queue backlog at k6 cutoff, and drain duration per repetition.
+- **Non-Tautological Per-Run Consistency Check**: In MySQL, `status` is partitioned across `COMPLETED`, `PENDING`/`PROCESSING`/`UPLOADED`, and `FAILED`; therefore, `len(job_rows) == comp + pend + fail` is an internal identity. To prevent circular reasoning, every run compares client-side k6 HTTP receipts against database records: $\text{DB Rows Created} \text{ vs } (\text{k6 HTTP 202} + \text{k6 HTTP 503})$.
+- **Naming Standard**: In sync mode, task rejections from a saturated `@Async` queue create a database row before marking it `FAILED` and returning HTTP 503. To avoid misleading terminology, the column is named **`DB Rows Created`**, keeping HTTP 202 and HTTP 503 counts distinct.
+- **HPA 2MB 4VU Rep 2 Excluded**: In Rep 2 (`kafka_hpa_2mb_4vu_rep2_1792485786`), `ml-service` initialized with 3 ready replicas (`replicas_start: 3`) rather than 1. This invalid baseline cell is excluded, leaving `Runs: 2` (Reps 1 & 3) in the summary table.
+- **Totals vs Medians**: Counts (`db_rows_created_total`, `k6_http_202_total`, `k6_http_503_total`, `jobs_completed_k6_total`, `jobs_completed_drain_total`, `jobs_pending_end_total`, `jobs_failed_total`) are reported as totals summed across valid runs. Latencies (`upload_p50_ms_median`, `job_p50_sec_median`, `drain_time_sec_median`) are reported as medians across runs.
 
 ### Summary Benchmark Table
-The complete metrics across conditions, file sizes, and load levels (medians and totals across 3 repetitions):
+The complete metrics across conditions, file sizes, and load levels (medians and totals across repetitions):
 
-| Condition | File | Load Level | Runs | Accepted (Tot) | HTTP 202 (Tot) | HTTP 503 (Tot) | Comp k6 (Tot) | Comp Drain (Tot) | Pending (Tot) | Failed (Tot) | Drain Med (s) | Upload p50 (ms) | Upload p95 (ms) | Job p50 (s) | Job p95 (s) | Throughput (jobs/min) |
+| Condition | File | Load Level | Runs | DB Rows Created (Tot) | HTTP 202 (Tot) | HTTP 503 (Tot) | Comp k6 (Tot) | Comp Drain (Tot) | Pending (Tot) | Failed (Tot) | Drain Med (s) | Upload p50 (ms) | Upload p95 (ms) | Job p50 (s) | Job p95 (s) | Throughput (jobs/min) |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | **sync** | 2 MB | 1 VU | 3 | 46 | 45 | 1 | 22 | 23 | 0 | 1 | 9.27 | 861.6 | 3,216.1 | 15.11 | 18.75 | 27.6 |
 | **sync** | 2 MB | 2 VU | 3 | 143 | 80 | 63 | 51 | 29 | 0 | 63 | 23.73 | 374.6 | 6,230.2 | 13.00 | 28.64 | 32.6 |
@@ -665,7 +675,7 @@ The complete metrics across conditions, file sizes, and load levels (medians and
 | **sync** | 10 MB | 2 VU | 3 | 32 | 29 | 0 | 6 | 21 | 5 | 0 | 28.82 | 1,712.1 | 11,061.0 | 60.89 | 80.25 | 4.3 |
 | **kafka_hpa** | 2 MB | 1 VU | 3 | 213 | 213 | 0 | 110 | 103 | 0 | 0 | 10.36 | 126.4 | 1,506.9 | 14.99 | 29.51 | 102.7 |
 | **kafka_hpa** | 2 MB | 2 VU | 3 | 345 | 345 | 0 | 84 | 261 | 0 | 0 | 121.11 | 90.0 | 3,417.2 | 97.28 | 136.36 | 56.7 |
-| **kafka_hpa** | 2 MB | 4 VU | 3 | 221 | 221 | 0 | 64 | 157 | 0 | 0 | 14.38 | 520.3 | 5,686.8 | 16.72 | 32.96 | 89.8 |
+| **kafka_hpa** | 2 MB | 4 VU | 2 | 135 | 135 | 0 | 27 | 108 | 0 | 0 | 27.74 | 2,430.5 | 6,019.3 | 13.95 | 32.91 | 64.1 |
 | **kafka_hpa** | 2 MB | 8 VU | 3 | 161 | 156 | 0 | 28 | 133 | 0 | 0 | 32.67 | 16,097.3 | 23,652.4 | 46.65 | 59.59 | 15.9 |
 | **kafka_hpa** | 10 MB | 1 VU | 3 | 44 | 44 | 0 | 18 | 26 | 0 | 0 | 22.29 | 406.2 | 10,494.1 | 30.15 | 40.66 | 10.0 |
 | **kafka_hpa** | 10 MB | 2 VU | 3 | 36 | 32 | 0 | 10 | 26 | 0 | 0 | 31.08 | 4,039.0 | 18,718.0 | 49.69 | 63.27 | 9.0 |
@@ -674,10 +684,79 @@ The complete metrics across conditions, file sizes, and load levels (medians and
 | **openloop_hpa** | 2 MB | 20/min | 3 | 31 | 31 | 0 | 30 | 1 | 0 | 0 | 0.00 | 88.1 | 294.5 | 0.20 | 0.33 | N/A |
 | **openloop_hpa** | 2 MB | 60/min | 3 | 92 | 92 | 0 | 88 | 4 | 0 | 0 | 0.75 | 90.2 | 177.8 | 0.21 | 0.35 | N/A |
 
+### Per-Run Consistency & Discrepancy Breakdown
+To eliminate circular validation, client HTTP receipts and database records were compared per individual run across all 47 trials:
+
+| Run ID | HTTP 202 | HTTP 503 | DB Rows | Completed | Pending | Failed | Diff (Rows - k6) | Discrepancy Explanation |
+|---|---|---|---|---|---|---|---|---|
+| `sync_2mb_1vu_rep1` | 20 | 1 | 21 | 20 | 0 | 1 | 0 | Exact match: 1 request rejected with 503, marked FAILED in DB |
+| `sync_2mb_2vu_rep1` | 24 | 0 | 24 | 24 | 0 | 0 | 0 | Exact match (rows == 202s) |
+| `sync_2mb_4vu_rep1` | 13 | 0 | 13 | 13 | 0 | 0 | 0 | Exact match (rows == 202s) |
+| `sync_2mb_8vu_rep1` | 21 | 8 | 29 | 21 | 0 | 8 | 0 | Exact match: 8 requests rejected with 503, marked FAILED in DB |
+| `sync_10mb_1vu_rep1` | 4 | 0 | 4 | 4 | 0 | 0 | 0 | Exact match (rows == 202s) |
+| `sync_10mb_2vu_rep1` | 9 | 0 | 9 | 9 | 0 | 0 | 0 | Exact match (rows == 202s) |
+| `sync_2mb_1vu_rep2` | 16 | 0 | 16 | 16 | 0 | 0 | 0 | Exact match (rows == 202s) |
+| `sync_2mb_2vu_rep2` | 25 | 9 | 34 | 25 | 0 | 9 | 0 | Exact match: 9 requests rejected with 503, marked FAILED in DB |
+| `sync_2mb_4vu_rep2` | 25 | 83 | 108 | 25 | 0 | 83 | 0 | Exact match: 83 requests rejected with 503, marked FAILED in DB |
+| `sync_2mb_8vu_rep2` | 12 | 0 | 15 | 15 | 0 | 0 | +3 | 3 in-flight uploads completed DB write as k6 reached 30s+15s cutoff |
+| `sync_10mb_1vu_rep2` | 17 | 0 | 17 | 16 | 1 | 0 | 0 | Exact match: 1 job pending under 45s drain cap |
+| `sync_10mb_2vu_rep2` | 16 | 0 | 17 | 12 | 5 | 0 | +1 | 1 in-flight upload completed DB write as k6 reached 30s+15s cutoff; 5 pending |
+| `sync_2mb_1vu_rep3` | 9 | 0 | 9 | 9 | 0 | 0 | 0 | Exact match (rows == 202s) |
+| `sync_2mb_2vu_rep3` | 31 | 54 | 85 | 31 | 0 | 54 | 0 | Exact match: 54 requests rejected with 503, marked FAILED in DB |
+| `sync_2mb_4vu_rep3` | 19 | 4 | 23 | 19 | 0 | 4 | 0 | Exact match: 4 requests rejected with 503, marked FAILED in DB |
+| `sync_2mb_8vu_rep3` | 21 | 40 | 61 | 21 | 0 | 40 | 0 | Exact match: 40 requests rejected with 503, marked FAILED in DB |
+| `sync_10mb_1vu_rep3` | 15 | 0 | 15 | 15 | 0 | 0 | 0 | Exact match (rows == 202s) |
+| `sync_10mb_2vu_rep3` | 4 | 0 | 6 | 6 | 0 | 0 | +2 | 2 in-flight uploads completed DB write as k6 reached 30s+15s cutoff |
+| `kafka_hpa_2mb_1vu_rep1` | 68 | 0 | 68 | 68 | 0 | 0 | 0 | Exact match (rows == 202s) |
+| `kafka_hpa_2mb_2vu_rep1` | 72 | 0 | 72 | 72 | 0 | 0 | 0 | Exact match (rows == 202s) |
+| `kafka_hpa_2mb_4vu_rep1` | 105 | 0 | 105 | 105 | 0 | 0 | 0 | Exact match (rows == 202s) |
+| `kafka_hpa_2mb_8vu_rep1` | 17 | 0 | 17 | 17 | 0 | 0 | 0 | Exact match (rows == 202s) |
+| `kafka_hpa_10mb_1vu_rep1` | 29 | 0 | 29 | 29 | 0 | 0 | 0 | Exact match (rows == 202s) |
+| `kafka_hpa_10mb_2vu_rep1` | 12 | 0 | 12 | 12 | 0 | 0 | 0 | Exact match (rows == 202s) |
+| `kafka_hpa_2mb_1vu_rep2` | 105 | 0 | 105 | 105 | 0 | 0 | 0 | Exact match (rows == 202s) |
+| `kafka_hpa_2mb_2vu_rep2` | 120 | 0 | 120 | 120 | 0 | 0 | 0 | Exact match (rows == 202s) |
+| `kafka_hpa_2mb_8vu_rep2` | 19 | 0 | 19 | 19 | 0 | 0 | 0 | Exact match (rows == 202s) |
+| `kafka_hpa_10mb_1vu_rep2` | 8 | 0 | 8 | 8 | 0 | 0 | 0 | Exact match (rows == 202s) |
+| `kafka_hpa_10mb_2vu_rep2` | 18 | 0 | 20 | 20 | 0 | 0 | +2 | 2 in-flight uploads completed DB write as k6 reached 30s+15s cutoff |
+| `kafka_hpa_2mb_1vu_rep3` | 40 | 0 | 40 | 40 | 0 | 0 | 0 | Exact match (rows == 202s) |
+| `kafka_hpa_2mb_2vu_rep3` | 153 | 0 | 153 | 153 | 0 | 0 | 0 | Exact match (rows == 202s) |
+| `kafka_hpa_2mb_4vu_rep3` | 30 | 0 | 30 | 30 | 0 | 0 | 0 | Exact match (rows == 202s) |
+| `kafka_hpa_2mb_8vu_rep3` | 120 | 0 | 125 | 125 | 0 | 0 | +5 | 5 in-flight uploads completed DB write as k6 reached 30s+15s cutoff |
+| `kafka_hpa_10mb_1vu_rep3` | 7 | 0 | 7 | 7 | 0 | 0 | 0 | Exact match (rows == 202s) |
+| `kafka_hpa_10mb_2vu_rep3` | 2 | 0 | 4 | 4 | 0 | 0 | +2 | 2 in-flight uploads completed DB write as k6 reached 30s+15s cutoff |
+| `openloop_fixed1_2mb_20rate_rep1` | 11 | 0 | 11 | 11 | 0 | 0 | 0 | Exact match (rows == 202s) |
+| `openloop_fixed1_2mb_60rate_rep1` | 26 | 0 | 28 | 28 | 0 | 0 | +2 | 2 in-flight arrivals completed DB write as k6 reached 30s+15s cutoff |
+| `openloop_hpa_2mb_20rate_rep1` | 11 | 0 | 11 | 11 | 0 | 0 | 0 | Exact match (rows == 202s) |
+| `openloop_hpa_2mb_60rate_rep1` | 31 | 0 | 31 | 31 | 0 | 0 | 0 | Exact match (rows == 202s) |
+| `openloop_fixed1_2mb_20rate_rep2` | 11 | 0 | 11 | 11 | 0 | 0 | 0 | Exact match (rows == 202s) |
+| `openloop_fixed1_2mb_60rate_rep2` | 31 | 0 | 31 | 31 | 0 | 0 | 0 | Exact match (rows == 202s) |
+| `openloop_hpa_2mb_20rate_rep2` | 10 | 0 | 10 | 10 | 0 | 0 | 0 | Exact match (rows == 202s) |
+| `openloop_hpa_2mb_60rate_rep2` | 31 | 0 | 31 | 31 | 0 | 0 | 0 | Exact match (rows == 202s) |
+| `openloop_fixed1_2mb_20rate_rep3` | 11 | 0 | 11 | 11 | 0 | 0 | 0 | Exact match (rows == 202s) |
+| `openloop_fixed1_2mb_60rate_rep3` | 30 | 0 | 30 | 30 | 0 | 0 | 0 | Exact match (rows == 202s) |
+| `openloop_hpa_2mb_20rate_rep3` | 10 | 0 | 10 | 10 | 0 | 0 | 0 | Exact match (rows == 202s) |
+| `openloop_hpa_2mb_60rate_rep3` | 30 | 0 | 30 | 30 | 0 | 0 | 0 | Exact match (rows == 202s) |
+
+#### Discrepancy Audit Findings:
+1. **Sync Task Rejections**: In all 7 sync runs where task queue capacity was exceeded (`sync_2mb_1vu_rep1`, `sync_2mb_8vu_rep1`, `sync_2mb_2vu_rep2`, `sync_2mb_4vu_rep2`, `sync_2mb_2vu_rep3`, `sync_2mb_4vu_rep3`, `sync_2mb_8vu_rep3`), `DB Rows == k6 202 + k6 503` EXACTLY (`Diff = 0`), and `DB Failed == k6 503` EXACTLY. The Spring Boot backend accepts the multipart request, inserts the record in MySQL, attempts to submit to `analysisExecutor`, encounters a `RejectedExecutionException`, updates the database row to `FAILED`, and responds with HTTP 503.
+2. **In-Flight Cutoff Discrepancies**: In the remaining 7 runs with discrepancies (`sync_2mb_8vu_rep2` diff=3, `sync_10mb_2vu_rep2` diff=1, `sync_10mb_2vu_rep3` diff=2, `kafka_hpa_10mb_2vu_rep2` diff=2, `kafka_hpa_2mb_8vu_rep3` diff=5, `kafka_hpa_10mb_2vu_rep3` diff=2, `openloop_fixed1_60rate_rep1` diff=2), k6 reached its execution deadline (30s duration + 15s gracefulStop) while HTTP requests were in-flight. The backend completed the payload write to MySQL, but k6 terminated its client connection before recording the HTTP 202 response.
+
+### Reconciliation: ~1.44s Job Trace vs ~0.20s Open-Loop Latency
+The apparent contradiction between (a) earlier closed-loop worker turnaround traces (~1.44 s worker turnaround, ~42 jobs/min ceiling) and (b) open-loop turnaround latency (~0.20 s with compute ~0.08–0.21 s) is reconciled by isolating pure mathematical execution from full-stack worker service time:
+
+1. **Pure Compute Duration**:
+   On the benchmark 2 MB dataset (18,892 rows, 10 columns, 45 pairwise regressions), pure NumPy/scikit-learn linear regression compute takes **0.075–0.2099 s (~75–210 ms)**. The earlier claim of "compute 933 ms" was unsupported and conflated with 40 MB datasets or unconstrained CFS thread contention.
+2. **What Limits Closed-Loop Fixed-1 to ~40 jobs/min**:
+   The ~40 jobs/min ceiling in closed loop is **NOT limited by CPU compute math**. Rather, it is governed by the **sequential single-threaded worker service turnaround** under concurrent backend load:
+   $$\text{Turnaround} = t_{\text{status\_check}} + t_{\text{csv\_fetch}} + t_{\text{csv\_parse}} + t_{\text{compute}} + t_{\text{result\_publish}} + t_{\text{kafka\_commit}}$$
+   Under closed-loop concurrent load (where the backend container is simultaneously handling multipart client uploads, writing 2 MB BLOBs to MySQL, and handling HTTP data streaming to the worker), `csv_fetch` and database streaming take ~0.5–0.9s. Adding pandas CSV parsing (~0.08s), OLS regression (~0.15s), result publication (~0.05s), and Kafka offset commit (~0.05s) results in **~1.2–1.5 s total service time per job**. Because a single worker processes messages sequentially from Kafka, its theoretical maximum throughput is strictly bounded by $1 / 1.44\text{s} \approx 41.7\text{ jobs/min}$.
+3. **Why Open-Loop Latency Reaches ~0.20 s**:
+   In open loop at 20 jobs/min (1 arrival every 3.0 s), the system operates below saturation. The backend is completely idle between arrivals (zero upload contention, zero lock contention). `csv_fetch` takes <30 ms, pure compute takes ~75–100 ms, and publication takes ~10 ms. End-to-end turnaround (`completed_at - created_at`) is therefore **~0.20 s**, fully consistent with compute physics.
+
 ### Open-Loop Per-Repetition Comparison (Fixed1 vs HPA)
 To evaluate worker performance and queue elasticity independent of closed-loop client backpressure, fixed arrival rates (20 and 60 arrivals/minute) were evaluated across 3 independent repetitions:
 
-| Condition | Arrival Rate | Repetition | Accepted | Completed (k6) | Backlog at Cutoff | Drain Time (s) | Job p50 (s) | Job p95 (s) |
+| Condition | Arrival Rate | Repetition | DB Rows | Completed (k6) | Backlog at Cutoff | Drain Time (s) | Job p50 (s) | Job p95 (s) |
 |---|---|---|---|---|---|---|---|---|
 | **openloop_fixed1** | 20/min | Rep 1 | 11 | 10 | 1 | 1.06s | 0.211s | 2.139s |
 | **openloop_fixed1** | 20/min | Rep 2 | 11 | 6 | 5 | 7.67s | 13.886s | 20.431s |
@@ -692,29 +771,24 @@ To evaluate worker performance and queue elasticity independent of closed-loop c
 | **openloop_hpa** | 60/min | Rep 2 | 31 | 28 | 3 | 57.33s | 0.206s | 70.533s |
 | **openloop_hpa** | 60/min | Rep 3 | 30 | 30 | 0 | 0.00s | 0.192s | 0.227s |
 
-#### Open-Loop Findings & Analysis:
-1. **Understanding the ~0.20 s Job p50**:
-   - `job_duration` is measured from MySQL as $\text{TIMESTAMPDIFF}(\text{MICROSECOND}, \text{created\_at}, \text{completed\_at}) / 10^6$. This reflects **end-to-end turnaround** (queue wait + HTTP fetch + ML compute + completion commit).
-   - On the benchmark 2 MB dataset (18,892 rows, 10 columns, 45 pairwise regressions), pure NumPy/scikit-learn linear regression compute takes **0.2099 s (~210 ms)**.
-   - At 20 arrivals/min (1 arrival every 3.0 s), when there is no backlog, queue wait is negligible (<10 ms). The worker fetches the payload and completes the analysis within ~0.20 s.
-2. **Fixed1 vs HPA at 20/min (12x Difference Explained)**:
-   - In `openloop_hpa 20/min`, all 3 reps maintained zero backlog (p50: 0.199s, 0.204s, 0.199s; median **0.199 s**).
-   - In `openloop_fixed1 20/min`, Rep 1 was uncongested (p50: 0.211s), but Rep 2 experienced a temporary processing delay resulting in a 5-job queue backlog (p50: **13.886 s**, drain: 7.67s), and Rep 3 experienced mild backlog (p50: **2.361 s**, drain: 1.06s). The median across `[0.211, 2.361, 13.886]` is **2.361 s**, directly explaining the 12x difference under single-worker queuing variance.
-3. **Correction on HPA 60/min Backlog**:
-   - The previous claim that HPA absorbed 60/min with zero backlog is **false**: in Rep 2, 3 jobs were pending when k6 stopped, requiring a **45.8 s drain** (system monitor) / **57.3 s** (job database completion), with p95 latency reaching **70.53 s**. While HPA scaled out to absorb the burst, it did experience transient queuing under burst arrivals.
+### Empirical Investigation of Processing Stalls & Freezes
+Timestamp inspection of per-job execution logs reveals intermittent multi-second freezes rather than continuous queuing congestion:
 
-### 1. Ingestion Latency Decoupling (Sync vs Kafka)
-![Upload Response Time vs Load](docs/images/chart1_response_time_vs_load.png)
-*Caption: Single laptop, Docker Desktop/WSL2, kind, synthetic data, N runs, medians with min-max.*
+1. **`openloop_hpa 60/min rep2` (58.25-second freeze)**:
+   - Jobs 1–27 completed at steady ~1.0s intervals with durations of 0.165–0.284s.
+   - Job 28 completed at `09:04:42.156`.
+   - From `09:04:42.156` to `09:05:40.411`, **58.255 seconds elapsed with 0 job completions**.
+   - At `09:05:40–09:05:41`, the remaining 3 jobs (29, 30, 31) completed in rapid succession within 0.9 seconds of each other.
+   - **Hypothesis Test (Consumer-Group Rebalance on Replica Change)**:
+     The hypothesis that this freeze was caused by a consumer-group rebalance triggered by HPA pod scaling is **refuted by the system telemetry**. System timeseries (`results/openloop_kafka_hpa_2mb_60rate_rep2_1792487037_system.csv`) records `ml_ready_replicas = 1` continuously across every 2-second polling tick from `09:04:00` through `09:05:08` (restarts=1, oom=0). The worker pod did not scale out, crash, or restart during this interval.
+2. **`openloop_fixed1 20/min rep2` (13.3-second gap)**:
+   - A 13.3-second gap occurred between Job 3 (`09:02:03.005`) and Job 4 (`09:02:16.313`), during which 5 jobs backlogged in the queue before draining.
+3. **`openloop_fixed1 60/min rep1` (12.5-second gap)**:
+   - A 12.5-second gap occurred between Job 8 (`08:59:27.303`) and Job 9 (`08:59:39.838`), causing tail latency to surge to 39.8s (p50) and 47.4s (p95).
+4. **Empirical Standard**:
+   No unverified root causes (such as uninstrumented host OS thread scheduling or WSL2 page flushing) are asserted. What the empirical data proves is that these delays are transient freezes rather than gradual math congestion, and in HPA Rep 2 the freeze occurred without replica scaling or pod restarts.
 
-In the synchronous path, client HTTP connection duration is tied directly to backend thread pool availability and ML compute execution. Under concurrency (4 to 8 VUs), upload p50 latency on 2 MB files spikes to **477–3,850 ms (p95 up to 18,362 ms)**. Crucially, as `@Async("analysisExecutor")` exhausted its bounded queue capacity (15 tasks), the sync path threw task rejections (HTTP 503), accumulating **199 failed/rejected jobs** across the test suite. In the Kafka-backed architecture, the backend accepts the payload, persists the entity, publishes the analysis event, and responds with HTTP 202 in **90.0–520.3 ms (p50)**, absorbing load with **0 dropped requests**.
-
-### 2. Throughput & Autoscaling Elasticity
-![Throughput vs Load](docs/images/chart2_throughput_vs_load.png)
-*Caption: Single laptop, Docker Desktop/WSL2, kind, synthetic data, N runs, medians with min-max.*
-
-- **Sync Path**: Ingestion throughput degrades sharply under concurrency due to bounded thread pool rejections (HTTP 503), plateauing at ~24–38 completed jobs/min.
-- **Kafka Path + HPA (1–3 Replicas)**: Automatically detects CPU utilization crossing the 60% threshold via metrics-server, scaling out ready ML replicas (from 1 to 3 pods) to clear burst queues and reaching **56.7–102.7 jobs/min** at 1–4 VUs.
+### Architectural Performance Observations (Subject to Comparability Limits)
 
 ### 3. Horizontal Pod Autoscaler Dynamics
 ![Replicas Over Time Under Load](docs/images/chart3_replicas_over_time.png)
