@@ -616,6 +616,9 @@ Under single-replica execution (HPAs removed, 1 replica pinned):
 > [!NOTE]
 > **Demo-Only Synthetic Delay**: The live failure demo script (`tests/demo/failure_demo.py`) configures `DEMO_COMPUTE_DELAY_SECONDS=10` on the `ml-service` deployment solely to widen the in-flight computation window for human inspection during live demonstrations. In normal operation and throughout all benchmark suites, `DEMO_COMPUTE_DELAY_SECONDS=0` (disabled; pure compute latency).
 
+> [!IMPORTANT]
+> **Exclusive Worker Execution (Docker Compose vs Kubernetes)**: When running or benchmarking against the Kubernetes cluster, the Docker Compose application containers (`epinet-backend` and `epinet-ml-service`) must remain stopped. Because both deployment modes share the same Kafka cluster and consumer group IDs (`epinet-ml-service` and `epinet-backend`), running them concurrently causes compose workers to compete with cluster pods for partition assignment and message processing.
+
 ---
 
 ## Benchmark Results

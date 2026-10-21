@@ -35,23 +35,39 @@ Write-Host "Repository Root : $repoRoot" -ForegroundColor Gray
 Write-Host "Window Mode     : $modeDesc" -ForegroundColor Gray
 
 # Step 1: Safe Profile Backup and Injection
-# WHY: Requirement 2: Back up settings.json to settings.json.bak-<timestamp> BEFORE modifying it,
-# set global defaults (font size 18, 'One Half Dark'), and verify parsing.
+# WHY: Keep ONE original backup (settings.json.bak-original) created only if it does not exist
+# and only if profiles.defaults has no fontSize/colorScheme. Never back up an already-modified file.
 $localStateDir = Join-Path $env:LOCALAPPDATA "Packages\Microsoft.WindowsTerminal_8wekyb3d8bbwe\LocalState"
 $settingsPath = Join-Path $localStateDir "settings.json"
+$backupOriginal = Join-Path $localStateDir "settings.json.bak-original"
 
 if (Test-Path $settingsPath) {
-    $ts = Get-Date -Format "yyyyMMdd-HHmmss"
-    $backupPath = Join-Path $localStateDir "settings.json.bak-$ts"
-    
-    # 1. Back up settings.json BEFORE any modifications
-    Copy-Item -Path $settingsPath -Destination $backupPath -Force
-    Write-Host ""
-    Write-Host "[SAFETY] Backed up Windows Terminal settings to:" -ForegroundColor Green
-    Write-Host "         $backupPath" -ForegroundColor Gray
+    $raw = Get-Content $settingsPath -Raw -Encoding UTF8
+    $json = $raw | ConvertFrom-Json
+    $defaults = $json.profiles.defaults
+
+    $hasModifications = $false
+    if ($defaults) {
+        if ($defaults.fontSize -or $defaults.colorScheme -or ($defaults.font -and $defaults.font.size)) {
+            $hasModifications = $true
+        }
+    }
+
+    # 1. Back up settings.json ONLY if bak-original does not exist and settings are not already modified
+    if (-not (Test-Path $backupOriginal)) {
+        if (-not $hasModifications) {
+            Copy-Item -Path $settingsPath -Destination $backupOriginal -Force
+            Write-Host ""
+            Write-Host "[SAFETY] Created original backup at: $backupOriginal" -ForegroundColor Green
+        } else {
+            Write-Warning "[SAFETY] settings.json already has fontSize/colorScheme in profiles.defaults; refusing to overwrite or create bak-original from modified file!"
+        }
+    } else {
+        Write-Host ""
+        Write-Host "[SAFETY] Preserving existing original backup: $backupOriginal" -ForegroundColor Gray
+    }
 
     # 2. Inject large font (size 18) and dark theme ('One Half Dark') into profiles.defaults
-    $json = Get-Content $settingsPath -Raw -Encoding UTF8 | ConvertFrom-Json
     if (-not $json.profiles.defaults) {
         $json.profiles | Add-Member -MemberType NoteProperty -Name 'defaults' -Value ([PSCustomObject]@{}) -Force
     }
@@ -65,14 +81,16 @@ if (Test-Path $settingsPath) {
     # 3. Verify that modified settings.json parses cleanly
     try {
         $verify = Get-Content $settingsPath -Raw -Encoding UTF8 | ConvertFrom-Json
-        if ($verify.profiles.defaults.fontSize -ne 18) {
-            throw "Verification failed: fontSize 18 not applied to profiles.defaults."
+        if ($verify.profiles.defaults.fontSize -ne 18 -or $verify.profiles.defaults.colorScheme -ne "One Half Dark") {
+            throw "Verification failed: fontSize or colorScheme not set in profiles.defaults."
         }
         $count = $verify.profiles.list.Count
         Write-Host "[SAFETY] Verified settings.json parsed successfully ($count profiles loaded, fontSize=18, theme='One Half Dark')." -ForegroundColor Green
     } catch {
-        Write-Error "CRITICAL: settings.json verification failed! Restoring backup..."
-        Copy-Item -Path $backupPath -Destination $settingsPath -Force
+        Write-Error "CRITICAL: settings.json verification failed! Restoring original backup..."
+        if (Test-Path $backupOriginal) {
+            Copy-Item -Path $backupOriginal -Destination $settingsPath -Force
+        }
         throw $_
     }
 } else {
@@ -89,7 +107,7 @@ $leftScript = Join-Path $repoRoot "tests\demo\left_pane.ps1"
 $rightScript = Join-Path $repoRoot "tests\demo\right_pane.ps1"
 
 # Step 2: Prompt and 10-second countdown
-# WHY: Requirement 3a: Gives operator time to press Win+Alt+R on the focused window.
+# WHY: Gives operator time to press Win+Alt+R on the focused window.
 Write-Host ""
 Write-Host "**********************************************************************" -ForegroundColor Yellow -BackgroundColor Black
 Write-Host "Press Win+Alt+R to start recording. Demo starts in 10 seconds." -ForegroundColor Yellow -BackgroundColor Black
@@ -108,7 +126,7 @@ Write-Host "Starting demo panes..." -ForegroundColor Green
 $wtProcess = Get-Process WindowsTerminal -ErrorAction SilentlyContinue
 
 if ($SameWindow -and $wtProcess) {
-    # WHY: Requirement 3: SameWindow mode splits the existing focused Windows Terminal window (-w 0),
+    # WHY: SameWindow mode splits the existing focused Windows Terminal window (-w 0),
     # so Game Bar recording (which captures the focused window) remains active and recording uninterrupted.
     Write-Host "Mode: SameWindow -- Splitting current focused window..." -ForegroundColor Cyan
     
