@@ -47,6 +47,9 @@ def truncate_db():
     run_cmd(["docker", "compose", "exec", "-T", "mysql", "mysql", "-uroot", "-proot_pass", "-e", "TRUNCATE TABLE epinet.analysis_run;"])
 
 
+# NOTE: The multi-retry replica guard loop below was added as a harness hardening improvement
+# to prevent runs from starting with >1 replica (as observed in excluded run kafka_hpa_2mb_4vu_rep2).
+# This guard is UNTESTED in live benchmark execution since benchmarks were not re-run.
 def reset_hpa_to_single_replica(max_retries=5):
     """Ensures HPA is recreated and ml-service has exactly 1 ready replica, retrying and aborting if not held."""
     for attempt in range(1, max_retries + 1):
@@ -85,6 +88,8 @@ def get_ml_replicas():
         return 0
 
 
+# NOTE: get_kafka_consumer_lag was added to inspect Kafka consumer group lag between test cells.
+# This function is UNTESTED in live benchmark execution since benchmarks were not re-run.
 def get_kafka_consumer_lag():
     out, err, code = run_cmd([
         "docker", "exec", "epinet-kafka",
@@ -422,7 +427,7 @@ def run_openloop_suite(duration=30):
 
     for rep in range(1, reps + 1):
         for cond in conditions:
-            # Explicit state reset between conditions
+            # Explicit state reset between conditions (UNTESTED in live benchmark execution)
             print(f"\n[CONDITION SETUP] Resetting state for condition: {cond}")
             truncate_db()
             if cond == "kafka_fixed1":

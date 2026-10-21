@@ -31,6 +31,7 @@ RESULTS_DIR = os.path.abspath("results")
 DOCS_DIR = os.path.abspath("docs")
 DOCS_IMG_DIR = os.path.join(DOCS_DIR, "images")
 CAPTION_TEXT = "Single laptop, Docker Desktop/WSL2, kind, synthetic data, N runs, medians with min-max."
+CAPTION_TEXT_COMPARISON = "Single laptop, Docker Desktop/WSL2, kind, synthetic data. Note: Sync and Kafka suites used different schedules/caps and are not directly comparable."
 
 
 def percentile(data, p):
@@ -161,7 +162,7 @@ def parse_jobs(filepath, k6_end_ts=None):
         drain_time = max(0.0, t_last_complete - k6_end_ts)
 
     accepted = len(job_rows)
-    return p50, p95, comp_k6, comp_drain, pending_end, failed, t_first_create, t_last_complete, round(drain_time, 2), accepted
+    return p50, p95, comp_k6, comp_drain, pending_end, failed, t_first_create, t_last_complete, round(drain_time, 2), accepted, job_rows
 
 
 def parse_system(filepath):
@@ -293,7 +294,7 @@ def process_manifest_runs(manifest_entries):
         sys_f = os.path.join(RESULTS_DIR, f"{run_id}_system.csv")
 
         up_p50, up_p95, req_202, req_503, k6_t0, k6_t1 = parse_k6_raw(k6_f)
-        job_p50, job_p95, comp_k6, comp_drain, pending_end, failed, t_c0, t_c1, drain_time, accepted = parse_jobs(jobs_f, k6_t1)
+        job_p50, job_p95, comp_k6, comp_drain, pending_end, failed, t_c0, t_c1, drain_time, accepted, job_rows = parse_jobs(jobs_f, k6_t1)
         max_reps, restarts, oom, min_free, min_avail, max_swap, ts_data = parse_system(sys_f)
 
         total_completed = comp_k6 + comp_drain
@@ -312,7 +313,34 @@ def process_manifest_runs(manifest_entries):
         if failed > 0 and req_503 == failed and diff == 0:
             explanation = f"Exact match: backend created row then marked FAILED on 503 ({failed} rejected)"
         elif diff > 0:
-            explanation = f"{diff} in-flight upload(s) persisted in MySQL after k6 30s+15s cutoff"
+            # Audit every extra row relative to k6_end
+            extra_audit_entries = []
+            all_in_flight = True
+            for idx in range(k6_total, len(job_rows)):
+                j = job_rows[idx]
+                cat = j.get("created_at")
+                jid = j.get("id", "")
+                rel_s = None
+                if cat and cat != "NULL" and k6_t1:
+                    try:
+                        dt = datetime.datetime.fromisoformat(cat).replace(tzinfo=datetime.timezone.utc).timestamp()
+                        rel_s = dt - k6_t1
+                        if rel_s > 0:
+                            all_in_flight = False
+                    except Exception:
+                        all_in_flight = False
+                rel_str = f"{rel_s:+.3f}s" if rel_s is not None else "N/A"
+                extra_audit_entries.append(f"row {idx+1} [id={jid[:8] if jid else '?'}] created_at={cat} (rel={rel_str})")
+
+            # Print audit to console for every run with diff != 0
+            print(f"  [EXTRA ROW AUDIT] {run_id} (diff={diff:+d}):")
+            for entry_str in extra_audit_entries:
+                print(f"    -> {entry_str}")
+
+            if all_in_flight:
+                explanation = f"{diff} in-flight upload(s) (persisted in DB before k6 cutoff, HTTP response unreturned at cutoff)"
+            else:
+                explanation = f"{diff} extra DB row(s) relative to k6 HTTP receipts (persisted after k6 cutoff)"
         elif diff < 0:
             explanation = f"{abs(diff)} requests received HTTP 202 before row commit"
 
@@ -476,6 +504,28 @@ def write_summary_csv(rows, filepath):
     print(f"[SUMMARY] Saved summary table -> {filepath}")
 
 
+def write_per_run_csv(trials, filepath):
+    if not trials:
+        return
+    fieldnames = [
+        "run_id", "condition", "is_open_loop", "file_mb", "load_level", "vus", "rep",
+        "db_rows_created", "k6_http_202", "k6_http_503",
+        "jobs_completed_k6", "jobs_completed_drain", "jobs_pending_end", "jobs_failed",
+        "drain_time_sec", "upload_p50_ms", "upload_p95_ms", "job_p50_sec", "job_p95_sec",
+        "throughput_jobs_min", "max_replicas", "restarts", "oom_killed",
+        "min_vm_free_mb", "min_vm_avail_mb", "max_swap_used_mb", "file_name"
+    ]
+    with open(filepath, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for t in trials:
+            row = dict(t)
+            if row.get("throughput_jobs_min") is not None:
+                row["throughput_jobs_min"] = f"{row['throughput_jobs_min']:.2f}"
+            writer.writerow(row)
+    print(f"[PER-RUN] Saved per-run table -> {filepath}")
+
+
 def generate_charts(summary_dict):
     plt.style.use("seaborn-v0_8-whitegrid" if "seaborn-v0_8-whitegrid" in plt.style.available else "default")
     os.makedirs(DOCS_IMG_DIR, exist_ok=True)
@@ -509,7 +559,7 @@ def generate_charts(summary_dict):
     ax.set_xticks(x)
     ax.set_xticklabels(x_labels, fontsize=10)
     ax.legend(frameon=True, loc="upper left", fontsize=9)
-    fig.text(0.5, 0.01, CAPTION_TEXT, ha="center", fontsize=8, color="#555555", style="italic")
+    fig.text(0.5, 0.01, CAPTION_TEXT_COMPARISON, ha="center", fontsize=8, color="#555555", style="italic")
     plt.tight_layout(rect=[0, 0.03, 1, 0.97])
     p1 = os.path.join(RESULTS_DIR, "chart1_response_time_vs_load.png")
     plt.savefig(p1)
@@ -527,7 +577,7 @@ def generate_charts(summary_dict):
     ax.set_ylabel("Throughput (jobs / min)", fontsize=11)
     ax.set_xlabel("Concurrency / Workload", fontsize=11)
     ax.legend(frameon=True, loc="upper left", fontsize=10)
-    fig.text(0.5, 0.01, CAPTION_TEXT, ha="center", fontsize=8, color="#555555", style="italic")
+    fig.text(0.5, 0.01, CAPTION_TEXT_COMPARISON, ha="center", fontsize=8, color="#555555", style="italic")
     plt.tight_layout(rect=[0, 0.03, 1, 0.97])
     p2 = os.path.join(RESULTS_DIR, "chart2_throughput_vs_load.png")
     plt.savefig(p2)
@@ -667,6 +717,12 @@ def main():
     out_docs_csv = os.path.join(DOCS_DIR, "benchmark_summary.csv")
     write_summary_csv(summary_rows, out_res_csv)
     write_summary_csv(summary_rows, out_docs_csv)
+
+    # Write per-run CSV to results/ and docs/
+    out_res_per_run = os.path.join(RESULTS_DIR, "benchmark_per_run.csv")
+    out_docs_per_run = os.path.join(DOCS_DIR, "benchmark_per_run.csv")
+    write_per_run_csv(trials, out_res_per_run)
+    write_per_run_csv(trials, out_docs_per_run)
 
     print_open_loop_reps(trials)
     generate_charts(summary_dict)
