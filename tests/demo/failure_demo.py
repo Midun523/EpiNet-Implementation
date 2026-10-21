@@ -173,6 +173,8 @@ def run_demo_trial(trial_num=1, target_mb=10.0, delay_sec=10):
     t_kill = now_local()
     print(f"[{fmt_ts(t_kill)}] Pod kill: kubectl delete pod {target_pod} --now", flush=True)
     run_cmd(["kubectl", "delete", "pod", target_pod, "--now"])
+    # WHY: Explain pod watch status in the recording so viewer understands the 'Error' status is from SIGKILL/delete.
+    print("[NOTE] Old pod killed by kubectl delete; status Error is expected in pod watch pane.", flush=True)
 
     # 5. Track replacement pod creation and Ready status
     t_pod_created = None
